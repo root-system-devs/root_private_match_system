@@ -99,9 +99,11 @@ async def create_season(inter: Interaction, name: str):
     async with SessionLocal() as db:
         now = datetime.now(timezone.utc)
         end = datetime.fromtimestamp(now.timestamp() + 60*60*24*90, tz=timezone.utc)
+        existing_active = (await db.execute(select(Season).where(Season.is_active == True))).scalars().all()
+        for season in existing_active:
+            season.is_active = False
         s = Season(name=name, start_date=now, end_date=end, is_active=True)
         db.add(s)
-# 既存のis_activeを落とす運用にするならここで
         await db.commit()
     await inter.response.send_message(f"シーズン {name} を開始しました。", ephemeral=True)
 
@@ -154,9 +156,15 @@ class EntryView(ui.View):
             sess = await ensure_pending_session(db, season.id, self.week)
             ent = await db.scalar(select(Entry).where(and_(Entry.session_id==sess.id, Entry.user_id==user.id)))
             if ent:
-                ent.status = "canceled"
-                await db.commit()
-                await inter.response.send_message("キャンセルしました。", ephemeral=True)
+                if ent.status == "confirmed":
+                    ent.status = "canceled"
+                    score = await db.scalar(select(SeasonScore).where(and_(SeasonScore.season_id==season.id, SeasonScore.user_id==user.id)))
+                    if score:
+                        score.entry_points -= 0.5
+                    await db.commit()
+                    await inter.response.send_message("キャンセルしました（-0.5pt）。", ephemeral=True)
+                else:
+                    await inter.response.send_message("既にキャンセル済みです。", ephemeral=True)
             else:
                 await inter.response.send_message("参加登録が見つかりません。", ephemeral=True)
 
