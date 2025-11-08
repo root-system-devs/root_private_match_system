@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+
+# Env
+.env
+
+
+# DBデータ（Docker volumeはGit管理しない）
+*.db
+pgdata/
+
+# macOS
+.DS_Store

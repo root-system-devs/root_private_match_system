@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# 仮想環境・ツール
+.venv/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.cache/
+.vscode/
+.idea/
+
+# VCS
+.git/
+.gitignore
+
+# Node等（もしあれば）
+node_modules/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# データ・ログ
+*.db
+pgdata/
+backups/
+logs/

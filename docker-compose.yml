@@ -1,0 +1,33 @@
+version: "3.9"
+
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: pass
+      POSTGRES_DB: league
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d league"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+
+  bot:
+    build: .
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    # ホットリロードが欲しいときだけ（ホストのファイルをコンテナに反映）
+    volumes:
+      - .:/app
+    restart: unless-stopped
+
+volumes:
+  pgdata:
