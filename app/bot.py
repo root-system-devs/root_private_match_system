@@ -13,7 +13,7 @@ from discord.ext import commands
 from datetime import datetime, timezone
 from sqlalchemy import select, and_, func, desc
 from .db import SessionLocal, init_models
-from .models import User, Season, Session as GameSession, Entry, SessionStat, SeasonScore, Match
+from .models import User, Season, Session as GameSession, Entry, SessionStat, SeasonScore, Match, SeasonParticipant
 from .team_balance import split_4v4_min_diff
 from typing import Optional
 
@@ -29,6 +29,7 @@ ROOM_LABELS = list("123456789")
 async def on_ready():
     await init_models()
     await bot.tree.sync()
+    bot.add_view(RegisterView())
     print(f"Logged in as {bot.user}")
 
 
@@ -85,21 +86,46 @@ async def _start_session(db, session_id: int) -> str:
     await db.commit()
     return f"Session {session_id} を開始しました。"
 
-# 部屋名に対応するチャンネルを取得 or 作成し、そこに引数msgを投稿する関数
+# 部屋名に対応するテキスト&ボイスチャンネルを「るーとさんプラベ」カテゴリ内で確保し、テキストへ投稿
 async def _post_to_room_channel(inter: Interaction, room_label: str, msg: str):
     guild = inter.guild
-    channel_name = f"room-{room_label.lower()}"
-    channel = discord.utils.get(guild.text_channels, name=channel_name)
+    base_name = f"room-{room_label.lower()}"  # 例: room-a
 
-    # チャンネルが存在しなければ作成
-    if not channel:
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            guild.me: discord.PermissionOverwrite(read_messages=True)
-        }
-        channel = await guild.create_text_channel(channel_name, overwrites=overwrites)
+    # 1) カテゴリ取得 or 作成
+    category = discord.utils.get(guild.categories, name="るーとさんプラベ")
+    if not category:
+        category = await guild.create_category("るーとさんプラベ")
 
-    await channel.send(msg)
+    # 共有の権限（必要に応じて調整）
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        guild.me: discord.PermissionOverwrite(read_messages=True, connect=True, speak=True),
+    }
+
+    # 2) テキストチャンネル取得 or 作成（カテゴリ内）
+    text_ch = discord.utils.get(category.text_channels, name=base_name)
+    if not text_ch:
+        text_ch = await guild.create_text_channel(
+            base_name,
+            overwrites=overwrites,
+            category=category
+        )
+
+    # 3) ボイスチャンネル取得 or 作成（カテゴリ内）
+    #    ※同名で OK（テキスト/ボイスはタイプが違うため衝突しません）
+    voice_ch = discord.utils.get(category.voice_channels, name=base_name)
+    if not voice_ch:
+        voice_ch = await guild.create_voice_channel(
+            base_name,
+            overwrites=overwrites,
+            category=category,
+            # 必要なら制限なども指定できます:
+            # user_limit=8,
+            # bitrate=64000,
+        )
+
+    # 4) テキストチャンネルへ投稿
+    await text_ch.send(msg)
 
 async def get_session_players_with_wins(db, session_id: int):
 # entries→confirmedユーザーの wins を session_stats から取得
@@ -190,13 +216,53 @@ async def _finish_session(db, session_id: int) -> str:
     await db.commit()
     return f"Session {session_id} を終了し、当日の勝数をシーズンに加算しました。"
 
+# ---- 永続ビュー ----
+class RegisterView(ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # 永続化
+
+    # custom_id を固定して永続化可能にする
+    @ui.button(label="登録", style=discord.ButtonStyle.primary, custom_id="register:primary")
+    async def do_register(self, inter: Interaction, button: ui.Button):
+        async with SessionLocal() as db:
+            # 1) ユーザーをDBに登録（ensure_user）
+            user = await ensure_user(db, inter.user)
+
+            # 2) アクティブシーズンがあれば参加者に追加
+            season = await get_active_season(db)
+            if season:
+                exists = await db.scalar(
+                    select(SeasonParticipant).where(
+                        and_(SeasonParticipant.season_id == season.id,
+                             SeasonParticipant.user_id   == user.id)
+                    )
+                )
+                if not exists:
+                    db.add(SeasonParticipant(season_id=season.id, user_id=user.id))
+                    await db.commit()
+                    await inter.response.send_message(
+                        f"登録OK！シーズン{season.name}の参加者として記録しました。", ephemeral=True
+                    )
+                else:
+                    await inter.response.send_message(
+                        f"登録OK！既にシーズン{season.name}の参加者に登録済みです。", ephemeral=True
+                    )
+            else:
+                await inter.response.send_message(
+                    "登録OK！現在アクティブなシーズンはありません。", ephemeral=True
+                )
+
 
 # ========== コマンド ==========
 @bot.tree.command(description="リーグに登録")
 async def register(inter: Interaction):
-    async with SessionLocal() as db:
-        await ensure_user(db, inter.user)
-    await inter.response.send_message("登録OK！", ephemeral=True)
+    # メッセージに「登録」ボタンを表示
+    await inter.channel.send(
+        embed=discord.Embed(title="リーグ登録", description="下のボタンから登録してください。"),
+        view=RegisterView()
+    )
+    # 実行者にはエフェメラルで通知
+    await inter.response.send_message("登録ボタンを表示しました。", ephemeral=True)
 
 
 @bot.tree.command(description="アクティブシーズンを作成（管理者）")
@@ -206,6 +272,7 @@ async def create_season(inter: Interaction, name: str):
         now = datetime.now(timezone.utc)
         end = datetime.fromtimestamp(now.timestamp() + 60*60*24*90, tz=timezone.utc)
         existing_active = (await db.execute(select(Season).where(Season.is_active == True))).scalars().all()
+        # ここで前シーズンのロール削除を行いたい
         for season in existing_active:
             season.is_active = False
         s = Season(name=name, start_date=now, end_date=end, is_active=True)

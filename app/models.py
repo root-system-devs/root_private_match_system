@@ -24,6 +24,11 @@ class Season(Base):
     end_date: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     
+class SeasonParticipant(Base):
+    __tablename__ = "season_participants"
+    season_id: Mapped[int] = mapped_column(ForeignKey("seasons.id"), primary_key=True, index=True)
+    user_id:   Mapped[int] = mapped_column(ForeignKey("users.id"),   primary_key=True, index=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 class Session(Base):
     __tablename__ = "sessions"
