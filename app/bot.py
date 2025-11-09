@@ -221,35 +221,78 @@ class RegisterView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)  # 永続化
 
-    # custom_id を固定して永続化可能にする
     @ui.button(label="登録", style=discord.ButtonStyle.primary, custom_id="register:primary")
     async def do_register(self, inter: Interaction, button: ui.Button):
         async with SessionLocal() as db:
-            # 1) ユーザーをDBに登録（ensure_user）
+            # 1) ユーザーをDBに登録
             user = await ensure_user(db, inter.user)
 
-            # 2) アクティブシーズンがあれば参加者に追加
+            # 2) アクティブシーズンがあれば参加者に追加（冪等）
             season = await get_active_season(db)
-            if season:
-                exists = await db.scalar(
-                    select(SeasonParticipant).where(
-                        and_(SeasonParticipant.season_id == season.id,
-                             SeasonParticipant.user_id   == user.id)
-                    )
-                )
-                if not exists:
-                    db.add(SeasonParticipant(season_id=season.id, user_id=user.id))
-                    await db.commit()
-                    await inter.response.send_message(
-                        f"登録OK！シーズン{season.name}の参加者として記録しました。", ephemeral=True
-                    )
-                else:
-                    await inter.response.send_message(
-                        f"登録OK！既にシーズン{season.name}の参加者に登録済みです。", ephemeral=True
-                    )
-            else:
+            if not season:
                 await inter.response.send_message(
                     "登録OK！現在アクティブなシーズンはありません。", ephemeral=True
+                )
+                return
+
+            exists = await db.scalar(
+                select(SeasonParticipant).where(
+                    and_(SeasonParticipant.season_id == season.id,
+                         SeasonParticipant.user_id   == user.id)
+                )
+            )
+            if not exists:
+                db.add(SeasonParticipant(season_id=season.id, user_id=user.id))
+                await db.commit()
+
+            # 3) ロール付与（announce/create_season 時に作成された想定）
+            role_name = f"シーズン{season.name}参加者"
+            guild = inter.guild
+            role = discord.utils.get(guild.roles, name=role_name)
+
+            # 念のため Member オブジェクトを確実に取得
+            member = inter.user if isinstance(inter.user, discord.Member) else guild.get_member(inter.user.id)
+
+            if role is None:
+                # 役職が見つからない場合（運用上は作成済み想定だが一応案内）
+                await inter.response.send_message(
+                    f"登録OK！シーズン{season.name}の参加者として記録しました。\n"
+                    f"ただしロール「{role_name}」が見つかりません。管理者に作成を依頼してください。",
+                    ephemeral=True
+                )
+                return
+
+            # Botの階層チェック：role は bot の最上位ロールより下でないと付与できない
+            bot_member = guild.me
+            can_assign = role.position < bot_member.top_role.position
+
+            if not can_assign:
+                # 付与権限なし（ロール階層が上）
+                await inter.response.send_message(
+                    f"登録OK！シーズン{season.name}の参加者として記録しました。\n"
+                    f"権限の都合でロールを付与できませんでした。"
+                    f"ご自身でロール「{role_name}」を付与してください。",
+                    ephemeral=True
+                )
+                return
+
+            try:
+                await member.add_roles(role, reason="League registration")
+                msg = ("新規登録完了！" if not exists else "登録OK！") + f" シーズン{season.name}の参加者として記録しました。ロール「{role_name}」を付与しました。"
+                await inter.response.send_message(msg, ephemeral=True)
+            except discord.Forbidden:
+                # 権限不足（Manage Rolesが無い等）や階層競合で失敗した場合
+                await inter.response.send_message(
+                    f"登録OK！シーズン{season.name}の参加者として記録しました。\n"
+                    f"権限がなくロールを付与できませんでした。ご自身でロール「{role_name}」を付与してください。",
+                    ephemeral=True
+                )
+            except discord.HTTPException:
+                # その他のAPI失敗は一般的な案内
+                await inter.response.send_message(
+                    f"登録OK！シーズン{season.name}の参加者として記録しました。\n"
+                    f"ロール付与に失敗しました。後ほど再試行するか管理者にご連絡ください。",
+                    ephemeral=True
                 )
 
 
@@ -270,15 +313,36 @@ async def register(inter: Interaction):
 async def create_season(inter: Interaction, name: str):
     async with SessionLocal() as db:
         now = datetime.now(timezone.utc)
-        end = datetime.fromtimestamp(now.timestamp() + 60*60*24*90, tz=timezone.utc)
-        existing_active = (await db.execute(select(Season).where(Season.is_active == True))).scalars().all()
-        # ここで前シーズンのロール削除を行いたい
+        end = datetime.fromtimestamp(now.timestamp() + 60 * 60 * 24 * 90, tz=timezone.utc)
+
+        # 既存アクティブシーズンを無効化
+        existing_active = (await db.execute(
+            select(Season).where(Season.is_active == True)
+        )).scalars().all()
         for season in existing_active:
             season.is_active = False
+
+        # 新しいシーズンを作成
         s = Season(name=name, start_date=now, end_date=end, is_active=True)
         db.add(s)
         await db.commit()
-    await inter.response.send_message(f"シーズン {name} を開始しました。", ephemeral=True)
+
+    # ---- Discordロール作成 ----
+    guild = inter.guild
+    role_name = f"シーズン{name}参加者"
+
+    # 既に同名のロールが存在するかチェック
+    existing_role = discord.utils.get(guild.roles, name=role_name)
+    if not existing_role:
+        await guild.create_role(name=role_name)
+        role_msg = f"ロール「{role_name}」を作成しました。"
+    else:
+        role_msg = f"ロール「{role_name}」は既に存在します。"
+
+    await inter.response.send_message(
+        f"シーズン {name} を開始しました。\n{role_msg}",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(description="今週の参加告知を出す（管理者）")
