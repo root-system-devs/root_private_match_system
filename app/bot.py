@@ -1,6 +1,7 @@
 import os
 from dotenv import load_dotenv
 
+# トークンの読み込み
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 if not TOKEN:
@@ -21,7 +22,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
-ROOM_LABELS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+ROOM_LABELS = list("123456789")
 
 
 @bot.event
@@ -31,7 +32,7 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
 
 
-
+# Discord上のユーザーがDBにいない場合、自動的に登録
 async def ensure_user(db, member: discord.abc.User):
     uid = str(member.id)
     u = await db.scalar(select(User).where(User.discord_user_id == uid))
@@ -41,12 +42,12 @@ async def ensure_user(db, member: discord.abc.User):
         await db.commit(); await db.refresh(u)
     return u
 
-
+# 現在アクティブなシーズンを取得
 async def get_active_season(db):
     s = await db.scalar(select(Season).where(Season.is_active == True))
     return s
 
-
+# 現在待ち状態(PENDING)のセッションを取得、なければ作成
 async def ensure_pending_session(db, season_id: int, week: int):
     s = await db.scalar(select(GameSession).where(
         and_(GameSession.season_id==season_id, GameSession.week_number==week, GameSession.room_label=="PENDING")
@@ -57,13 +58,13 @@ async def ensure_pending_session(db, season_id: int, week: int):
         db.add(s); await db.commit(); await db.refresh(s)
     return s
 
-
+# 指定された試合（session_id）に「参加が確定している（confirmed）」ユーザーのエントリーを取得
 async def list_entries(db, session_id: int):
     q = select(Entry).where(and_(Entry.session_id==session_id, Entry.status=="confirmed")).order_by(Entry.id.asc())
     result = (await db.execute(q)).scalars().all()
     return result
 
-
+# 指定された試合の参加者たちの勝利数カウント用の行を作る
 async def init_session_stats(db, session_id: int, user_ids: list[int]):
     for uid in user_ids:
         exists = await db.scalar(select(SessionStat).where(and_(SessionStat.session_id==session_id, SessionStat.user_id==uid)))
@@ -71,6 +72,18 @@ async def init_session_stats(db, session_id: int, user_ids: list[int]):
             db.add(SessionStat(session_id=session_id, user_id=uid, wins=0))
     await db.commit()
 
+
+async def _start_session(db, session_id: int) -> str:
+    sess = await db.get(GameSession, session_id)
+    if not sess:
+        return "セッションが見つかりません。"
+    if sess.status == "finished":
+        return f"Session {session_id} は終了済みのため開始できません。"
+    if sess.status == "live":
+        return f"Session {session_id} は既に live です。"
+    sess.status = "live"
+    await db.commit()
+    return f"Session {session_id} を開始しました。"
 
 async def get_session_players_with_wins(db, session_id: int):
 # entries→confirmedユーザーの wins を session_stats から取得
@@ -83,6 +96,83 @@ async def get_session_players_with_wins(db, session_id: int):
     )).scalars().all() }
     players = [ {"user_id":uid, "wins":stats_map.get(uid,0)} for uid in uids ]
     return players
+
+async def _create_next_match_and_message(db, session_id: int) -> str:
+    sess = await db.get(GameSession, session_id)
+    if not sess:
+        return "セッションが見つかりません。"
+    if sess.status == "finished":
+        return f"Session {session_id} は既に終了済みです。"
+
+    players = await get_session_players_with_wins(db, session_id)
+    if len(players) < 8:
+        return "プレイヤーが8人揃っていません。"
+
+    # バランス編成（playersは {user_id, wins} の配列を想定）
+    teamA, teamB = split_4v4_min_diff(players)
+
+    # 次の match_index を決定
+    last = await db.scalar(
+        select(Match)
+        .where(Match.session_id == session_id)
+        .order_by(desc(Match.match_index))
+    )
+    next_idx = (last.match_index + 1) if last else 1
+
+    # Match を作成
+    m = Match(
+        session_id=session_id,
+        match_index=next_idx,
+        team_a_ids=",".join(map(str, teamA)),
+        team_b_ids=",".join(map(str, teamB)),
+    )
+    db.add(m)
+    await db.commit()
+    await db.refresh(m)
+
+    # 表示用メンションを作成
+    async def mention(uid: int) -> str:
+        u = await db.get(User, uid)
+        return f"<@{u.discord_user_id}>" if u else f"(uid:{uid})"
+
+    msg = (
+        f"**Session {session_id} — Match #{next_idx}**\n"
+        f"Team A: " + " ".join([await mention(u) for u in teamA]) + "\n"
+        f"Team B: " + " ".join([await mention(u) for u in teamB])
+    )
+    return msg
+
+async def _finish_session(db, session_id: int) -> str:
+    sess = await db.get(GameSession, session_id)
+    if not sess:
+        return "セッションが見つかりません。"
+    if sess.status == "finished":
+        return f"Session {session_id} は既に終了済みです。"
+
+    # 該当セッションの全ユーザーの wins を取得
+    stats = (await db.execute(
+        select(SessionStat).where(SessionStat.session_id == session_id)
+    )).scalars().all()
+
+    season = await get_active_season(db)
+    if not season:
+        return "アクティブなシーズンが見つかりません。"
+
+    # シーズン累計へ加算
+    for st in stats:
+        sc = await db.scalar(select(SeasonScore).where(
+            and_(SeasonScore.season_id == season.id, SeasonScore.user_id == st.user_id)
+        ))
+        if not sc:
+            sc = SeasonScore(season_id=season.id, user_id=st.user_id,
+                             entry_points=0.0, win_points=0)
+            db.add(sc)
+        sc.win_points += int(st.wins)
+
+    # セッションを終了
+    sess.status = "finished"
+    await db.commit()
+    return f"Session {session_id} を終了し、当日の勝数をシーズンに加算しました。"
 
 
 # ========== コマンド ==========
@@ -174,127 +264,139 @@ async def close_entries(inter: Interaction, week: int):
     async with SessionLocal() as db:
         season = await get_active_season(db)
         pending = await ensure_pending_session(db, season.id, week)
+
         entries = await list_entries(db, pending.id)
         confirmed_ids = [e.user_id for e in entries if e.status == "confirmed"]
+
         if len(confirmed_ids) < 8:
             await inter.response.send_message("参加者が8人未満のため部屋確定できません。", ephemeral=True)
             return
+
         # 8人ずつ切って部屋を作る
         chunks = [confirmed_ids[i:i+8] for i in range(0, len(confirmed_ids), 8)]
         messages = []
+
         for idx, chunk in enumerate(chunks):
             if len(chunk) < 8:
                 break
+
             room = ROOM_LABELS[idx]
-            sess = GameSession(season_id=season.id, week_number=week, room_label=room,
-                    scheduled_at=datetime.now(timezone.utc), status="scheduled")
-            db.add(sess); await db.commit(); await db.refresh(sess)
+
+            # セッション作成（scheduled）
+            sess = GameSession(
+                season_id=season.id,
+                week_number=week,
+                room_label=room,
+                scheduled_at=datetime.now(timezone.utc),
+                status="scheduled",
+            )
+            db.add(sess)
+            await db.commit()
+            await db.refresh(sess)
+
             # この部屋の entries を作成
             for uid in chunk:
                 db.add(Entry(session_id=sess.id, user_id=uid, status="confirmed"))
             await db.commit()
+
             # 当日勝数の初期化
             await init_session_stats(db, sess.id, chunk)
+
+            # セッション開始（liveへ）  ※冪等ヘルパー
+            start_msg = await _start_session(db, sess.id)
+
+            # 1試合目のチームを自動生成＆発表  ※ここを追加
+            next_msg = await _create_next_match_and_message(db, sess.id)
+
             # メンション文
-            mentions = " ".join([f"<@{(await db.scalar(select(User).where(User.id==uid))).discord_user_id}>" for uid in chunk])
-            messages.append(f"Week {week} 部屋 **{room}** を確定：{mentions}\nSession ID: `{sess.id}`")
-        await inter.response.send_message("\n".join(messages), ephemeral=False)
+            mentions = " ".join([
+                f"<@{(await db.scalar(select(User).where(User.id == uid))).discord_user_id}>"
+                for uid in chunk
+            ])
 
+            messages.append(
+                f"Week {week} 部屋 **{room}** を確定：{mentions}\n"
+                f"Session ID: `{sess.id}`\n"
+                f"{start_msg}\n\n"
+                f"{next_msg}"
+            )
 
-
-@bot.tree.command(description="セッション開始（liveに変更）")
-@commands.has_permissions(manage_guild=True)
-async def start_session(inter: Interaction, session_id: int):
-    async with SessionLocal() as db:
-        sess = await db.get(GameSession, session_id)
-        if not sess:
-            await inter.response.send_message("セッションが見つかりません。", ephemeral=True)
-            return
-        sess.status = "live"
-        await db.commit()
-    await inter.response.send_message(f"Session {session_id} を開始しました。", ephemeral=False)
-
-@bot.tree.command(description="次の試合のチームを発表（8人の勝数バランス）")
-async def next_teams(inter: Interaction, session_id: int):
-    async with SessionLocal() as db:
-        sess = await db.get(GameSession, session_id)
-        if not sess:
-            await inter.response.send_message("セッションが見つかりません。", ephemeral=True)
-            return
-        players = await get_session_players_with_wins(db, session_id)
-        if len(players) < 8:
-            await inter.response.send_message("プレイヤーが8人揃っていません。", ephemeral=True)
-            return
-        teamA, teamB = split_4v4_min_diff(players)
-        # match_index を決定
-        last = await db.scalar(select(Match).where(Match.session_id==session_id).order_by(desc(Match.match_index)))
-        next_idx = (last.match_index + 1) if last else 1
-        m = Match(session_id=session_id, match_index=next_idx,
-                team_a_ids=",".join(map(str, teamA)),
-                team_b_ids=",".join(map(str, teamB)))
-        db.add(m); await db.commit(); await db.refresh(m)
-        # 表示
-        async def mention(uid:int):
-            u = await db.get(User, uid)
-            return f"<@{u.discord_user_id}>"
-        msg = (f"**Session {session_id} — Match #{next_idx}**\n"
-                f"Team A: " + " ".join([await mention(u) for u in teamA]) + "\n"
-                f"Team B: " + " ".join([await mention(u) for u in teamB]))
-    await inter.response.send_message(msg, ephemeral=False)
-
-
-
+        await inter.response.send_message("\n\n".join(messages), ephemeral=False)
 
 @bot.tree.command(description="直近未確定の試合に勝敗を記録")
-async def win(inter: Interaction, session_id: int, team: str, stage: str=""):
+async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
     team = team.upper()
-    if team not in ("A","B"):
+    if team not in ("A", "B"):
         await inter.response.send_message("team は A または B", ephemeral=True)
         return
+
     async with SessionLocal() as db:
-    # winner未設定の最新マッチを取得
-        m = await db.scalar(select(Match).where(and_(Match.session_id==session_id, Match.winner==None)).order_by(Match.match_index.asc()))
-        if not m:
-            await inter.response.send_message("勝敗未確定の試合が見つかりません。/next_teams で作成してください。", ephemeral=True)
-            return
-        m.winner = team
-        m.stage = stage
-    # 勝者側の wins を+1
-        ids = list(map(int, (m.team_a_ids if team=="A" else m.team_b_ids).split(",")))
-        for uid in ids:
-            stat = await db.scalar(select(SessionStat).where(and_(SessionStat.session_id==session_id, SessionStat.user_id==uid)))
-            if stat:
-                stat.wins += 1
-        await db.commit();
-    # 10勝到達のチェック
-        ten = await db.scalar(select(SessionStat).where(and_(SessionStat.session_id==session_id, SessionStat.wins>=10)))
-        if ten:
-            await inter.response.send_message(f"{inter.user.mention} 記録: Match #{m.match_index} → Team {team} 勝利。誰かが10勝に到達！ /finish を実行してください。", ephemeral=False)
-        else:
-            await inter.response.send_message(f"記録OK: Match #{m.match_index} → Team {team} 勝利", ephemeral=False)
-
-
-
-@bot.tree.command(description="セッション終了（10勝条件達成）")
-@commands.has_permissions(manage_guild=True)
-async def finish(inter: Interaction, session_id: int):
-    async with SessionLocal() as db:
+        # 終了済みチェック
         sess = await db.get(GameSession, session_id)
         if not sess:
             await inter.response.send_message("セッションが見つかりません。", ephemeral=True)
             return
-        # 参加8人の wins をシーズンに加算
-        stats = (await db.execute(select(SessionStat).where(SessionStat.session_id==session_id))).scalars().all()
-        season = await get_active_season(db)
-        for st in stats:
-            sc = await db.scalar(select(SeasonScore).where(and_(SeasonScore.season_id==season.id, SeasonScore.user_id==st.user_id)))
-            if not sc:
-                sc = SeasonScore(season_id=season.id, user_id=st.user_id, entry_points=0.0, win_points=0)
-                db.add(sc)
-            sc.win_points += int(st.wins)
-        sess.status = "finished"
+        if sess.status == "finished":
+            await inter.response.send_message(
+                f"Session {session_id} は既に終了済みです。", ephemeral=True
+            )
+            return
+
+        # winner未設定の最新マッチを取得
+        m = await db.scalar(
+            select(Match)
+            .where(and_(Match.session_id == session_id, Match.winner == None))
+            .order_by(Match.match_index.asc())
+        )
+        if not m:
+            await inter.response.send_message(
+                "勝敗未確定の試合が見つかりません。次試合の作成を試みます…",
+                ephemeral=True,
+            )
+            # 保険として、未確定が無いなら次試合を作っておく（任意）
+            msg = await _create_next_match_and_message(db, session_id)
+            await inter.followup.send(msg, ephemeral=False)
+            return
+
+        # 勝敗を反映
+        m.winner = team
+        m.stage = stage
+
+        # 勝者側の wins を+1
+        ids = list(map(int, (m.team_a_ids if team == "A" else m.team_b_ids).split(",")))
+        for uid in ids:
+            stat = await db.scalar(
+                select(SessionStat).where(
+                    and_(SessionStat.session_id == session_id, SessionStat.user_id == uid)
+                )
+            )
+            if stat:
+                stat.wins += 1
+
         await db.commit()
-    await inter.response.send_message(f"Session {session_id} を終了し、当日の勝数をシーズンに加算しました。", ephemeral=False)
+
+        # 10勝到達のチェック
+        ten = await db.scalar(
+            select(SessionStat).where(
+                and_(SessionStat.session_id == session_id, SessionStat.wins >= 10)
+            )
+        )
+
+        if ten:
+            # 自動終了（シーズン加算＋ステータス変更）
+            finish_msg = await _finish_session(db, session_id)
+            await inter.response.send_message(
+                f"記録OK: Match #{m.match_index} → Team {team} 勝利\n"
+                f"誰かが10勝に到達！\n{finish_msg}",
+                ephemeral=False,
+            )
+        else:
+            # 次試合を自動生成・発表
+            next_msg = await _create_next_match_and_message(db, session_id)
+            await inter.response.send_message(
+                f"記録OK: Match #{m.match_index} → Team {team} 勝利\n\n{next_msg}",
+                ephemeral=False,
+            )
 
 
 @bot.tree.command(description="リーダーボードを表示")
