@@ -85,6 +85,22 @@ async def _start_session(db, session_id: int) -> str:
     await db.commit()
     return f"Session {session_id} を開始しました。"
 
+# 部屋名に対応するチャンネルを取得 or 作成し、そこに引数msgを投稿する関数
+async def _post_to_room_channel(inter: Interaction, room_label: str, msg: str):
+    guild = inter.guild
+    channel_name = f"room-{room_label.lower()}"
+    channel = discord.utils.get(guild.text_channels, name=channel_name)
+
+    # チャンネルが存在しなければ作成
+    if not channel:
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            guild.me: discord.PermissionOverwrite(read_messages=True)
+        }
+        channel = await guild.create_text_channel(channel_name, overwrites=overwrites)
+
+    await channel.send(msg)
+
 async def get_session_players_with_wins(db, session_id: int):
 # entries→confirmedユーザーの wins を session_stats から取得
     ents = await list_entries(db, session_id)
@@ -272,9 +288,8 @@ async def close_entries(inter: Interaction, week: int):
             await inter.response.send_message("参加者が8人未満のため部屋確定できません。", ephemeral=True)
             return
 
-        # 8人ずつ切って部屋を作る
         chunks = [confirmed_ids[i:i+8] for i in range(0, len(confirmed_ids), 8)]
-        messages = []
+        summary_msgs = []
 
         for idx, chunk in enumerate(chunks):
             if len(chunk) < 8:
@@ -282,7 +297,7 @@ async def close_entries(inter: Interaction, week: int):
 
             room = ROOM_LABELS[idx]
 
-            # セッション作成（scheduled）
+            # セッション作成
             sess = GameSession(
                 season_id=season.id,
                 week_number=week,
@@ -291,37 +306,41 @@ async def close_entries(inter: Interaction, week: int):
                 status="scheduled",
             )
             db.add(sess)
-            await db.commit()
-            await db.refresh(sess)
+            await db.commit(); await db.refresh(sess)
 
-            # この部屋の entries を作成
+            # entries作成
             for uid in chunk:
                 db.add(Entry(session_id=sess.id, user_id=uid, status="confirmed"))
             await db.commit()
 
-            # 当日勝数の初期化
+            # 当日勝数初期化
             await init_session_stats(db, sess.id, chunk)
 
-            # セッション開始（liveへ）  ※冪等ヘルパー
+            # セッション開始
             start_msg = await _start_session(db, sess.id)
 
-            # 1試合目のチームを自動生成＆発表  ※ここを追加
+            # 第1試合チーム自動生成
             next_msg = await _create_next_match_and_message(db, sess.id)
 
-            # メンション文
+            # メンション文作成
             mentions = " ".join([
                 f"<@{(await db.scalar(select(User).where(User.id == uid))).discord_user_id}>"
                 for uid in chunk
             ])
 
-            messages.append(
-                f"Week {week} 部屋 **{room}** を確定：{mentions}\n"
-                f"Session ID: `{sess.id}`\n"
+            # 投稿メッセージ構築
+            msg = (
+                f"**Week {week} 部屋 {room} — Session {sess.id}**\n"
                 f"{start_msg}\n\n"
+                f"参加者: {mentions}\n\n"
                 f"{next_msg}"
             )
 
-        await inter.response.send_message("\n\n".join(messages), ephemeral=False)
+            # 各部屋チャンネルへ投稿
+            await _post_to_room_channel(inter, room, msg)
+            summary_msgs.append(f"部屋 {room} を開始し、チームを発表しました。")
+
+        await inter.response.send_message("\n".join(summary_msgs), ephemeral=False)
 
 @bot.tree.command(description="直近未確定の試合に勝敗を記録")
 async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
@@ -342,6 +361,8 @@ async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
             )
             return
 
+        room = sess.room_label  # ← 投稿先チャンネル名の決定に使う
+
         # winner未設定の最新マッチを取得
         m = await db.scalar(
             select(Match)
@@ -349,13 +370,10 @@ async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
             .order_by(Match.match_index.asc())
         )
         if not m:
-            await inter.response.send_message(
-                "勝敗未確定の試合が見つかりません。次試合の作成を試みます…",
-                ephemeral=True,
-            )
-            # 保険として、未確定が無いなら次試合を作っておく（任意）
+            # 未確定が無ければ次試合を作って部屋チャンネルへ発表
             msg = await _create_next_match_and_message(db, session_id)
-            await inter.followup.send(msg, ephemeral=False)
+            await _post_to_room_channel(inter, room, msg)
+            await inter.response.send_message("次試合を部屋チャンネルに投稿しました。", ephemeral=True)
             return
 
         # 勝敗を反映
@@ -385,18 +403,20 @@ async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
         if ten:
             # 自動終了（シーズン加算＋ステータス変更）
             finish_msg = await _finish_session(db, session_id)
-            await inter.response.send_message(
-                f"記録OK: Match #{m.match_index} → Team {team} 勝利\n"
-                f"誰かが10勝に到達！\n{finish_msg}",
-                ephemeral=False,
+            room_msg = (
+                f"**記録OK**: Match #{m.match_index} → Team {team} 勝利\n"
+                f"誰かが **10勝** に到達！\n{finish_msg}"
             )
+            await _post_to_room_channel(inter, room, room_msg)
+            await inter.response.send_message("結果を部屋チャンネルへ投稿し、セッションを終了しました。", ephemeral=True)
         else:
             # 次試合を自動生成・発表
             next_msg = await _create_next_match_and_message(db, session_id)
-            await inter.response.send_message(
-                f"記録OK: Match #{m.match_index} → Team {team} 勝利\n\n{next_msg}",
-                ephemeral=False,
+            room_msg = (
+                f"**記録OK**: Match #{m.match_index} → Team {team} 勝利\n\n{next_msg}"
             )
+            await _post_to_room_channel(inter, room, room_msg)
+            await inter.response.send_message("結果と次試合を部屋チャンネルへ投稿しました。", ephemeral=True)
 
 
 @bot.tree.command(description="リーダーボードを表示")
