@@ -1,5 +1,5 @@
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Integer, BigInteger, ForeignKey, Date, DateTime, Boolean, Text
+from sqlalchemy import String, Integer, BigInteger, ForeignKey, Date, DateTime, Boolean, Text, Float
 from sqlalchemy.sql import func
 from datetime import datetime
 
@@ -13,6 +13,7 @@ class User(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     discord_user_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     display_name: Mapped[str] = mapped_column(String(64))
+    xp: Mapped[float] = mapped_column(Float, default=2000.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -62,6 +63,7 @@ class SeasonScore(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
     entry_points: Mapped[float] = mapped_column(default=0.0)
     win_points: Mapped[int] = mapped_column(default=0)
+    rate: Mapped[float] = mapped_column(Float, default=2000.0)
 
 
 class Match(Base):
