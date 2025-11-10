@@ -87,9 +87,10 @@ async def _start_session(db, session_id: int) -> str:
     return f"Session {session_id} を開始しました。"
 
 # 部屋名に対応するテキスト&ボイスチャンネルを「るーとさんプラベ」カテゴリ内で確保し、テキストへ投稿
+# 部屋名に対応するテキストチャンネル + チームA/Bのボイスチャンネルを作成して投稿
 async def _post_to_room_channel(inter: Interaction, room_label: str, msg: str):
     guild = inter.guild
-    base_name = f"room-{room_label.lower()}"  # 例: room-a
+    base_name = f"room{room_label}"  # 例: room1
 
     # 1) カテゴリ取得 or 作成
     category = discord.utils.get(guild.categories, name="るーとさんプラベ")
@@ -102,7 +103,7 @@ async def _post_to_room_channel(inter: Interaction, room_label: str, msg: str):
         guild.me: discord.PermissionOverwrite(read_messages=True, connect=True, speak=True),
     }
 
-    # 2) テキストチャンネル取得 or 作成（カテゴリ内）
+    # 2) テキストチャンネル取得 or 作成
     text_ch = discord.utils.get(category.text_channels, name=base_name)
     if not text_ch:
         text_ch = await guild.create_text_channel(
@@ -111,20 +112,22 @@ async def _post_to_room_channel(inter: Interaction, room_label: str, msg: str):
             category=category
         )
 
-    # 3) ボイスチャンネル取得 or 作成（カテゴリ内）
-    #    ※同名で OK（テキスト/ボイスはタイプが違うため衝突しません）
-    voice_ch = discord.utils.get(category.voice_channels, name=base_name)
-    if not voice_ch:
-        voice_ch = await guild.create_voice_channel(
-            base_name,
-            overwrites=overwrites,
-            category=category,
-            # 必要なら制限なども指定できます:
-            # user_limit=8,
-            # bitrate=64000,
-        )
+    # 3) チームA・チームBのボイスチャンネルを取得 or 作成
+    voice_names = [f"{base_name}-A", f"{base_name}-B"]
 
-    # 4) テキストチャンネルへ投稿
+    for vname in voice_names:
+        voice_ch = discord.utils.get(category.voice_channels, name=vname)
+        if not voice_ch:
+            await guild.create_voice_channel(
+                vname,
+                overwrites=overwrites,
+                category=category,
+                # オプション設定
+                # user_limit=8,
+                # bitrate=64000,
+            )
+
+    # 4) テキストチャンネルに投稿
     await text_ch.send(msg)
 
 async def get_session_players_with_wins(db, session_id: int):
