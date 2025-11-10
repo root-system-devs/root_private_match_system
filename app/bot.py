@@ -11,7 +11,7 @@ import discord
 from discord import app_commands, ui, Interaction
 from discord.ext import commands
 from datetime import datetime, timezone
-from sqlalchemy import select, and_, func, desc
+from sqlalchemy import select, and_, func, desc, delete
 from .db import SessionLocal, init_models
 from .models import User, Season, Session as GameSession, Entry, SessionStat, SeasonScore, Match, SeasonParticipant
 from .team_balance import split_4v4_min_diff
@@ -186,6 +186,55 @@ async def _create_next_match_and_message(db, session_id: int) -> str:
         f"Team B: " + " ".join([await mention(u) for u in teamB])
     )
     return msg
+
+async def _apply_match_edit(db, match: Match, new_winner: str, new_stage: str) -> str:
+    """match の勝者・ステージを new_* に更新し、SessionStat の wins を差分反映する。"""
+    new_winner = new_winner.upper()
+    if new_winner not in ("A", "B"):
+        return "勝利チームは A または B を指定してください。"
+
+    # 変更前の情報
+    old_winner: Optional[str] = match.winner
+    old_stage: str = match.stage or ""
+
+    # チームメンバーをIDリスト化
+    team_a_ids = list(map(int, match.team_a_ids.split(","))) if match.team_a_ids else []
+    team_b_ids = list(map(int, match.team_b_ids.split(","))) if match.team_b_ids else []
+
+    # ① 旧勝者側の wins をデクリメント
+    if old_winner in ("A", "B"):
+        old_ids = team_a_ids if old_winner == "A" else team_b_ids
+        for uid in old_ids:
+            stat = await db.scalar(select(SessionStat).where(
+                and_(SessionStat.session_id == match.session_id,
+                     SessionStat.user_id    == uid)
+            ))
+            if stat and stat.wins > 0:
+                stat.wins -= 1
+
+    # ② 新勝者側の wins をインクリメント
+    new_ids = team_a_ids if new_winner == "A" else team_b_ids
+    for uid in new_ids:
+        stat = await db.scalar(select(SessionStat).where(
+            and_(SessionStat.session_id == match.session_id,
+                 SessionStat.user_id    == uid)
+        ))
+        if not stat:
+            # 念のため存在しない場合は作成（通常は init_session_stats で作られている想定）
+            stat = SessionStat(session_id=match.session_id, user_id=uid, wins=0)
+            db.add(stat)
+        stat.wins += 1
+
+    # ③ 試合オブジェクトを更新
+    match.winner = new_winner
+    match.stage  = new_stage
+
+    await db.commit()
+    await db.refresh(match)
+
+    return (f"Match #{match.match_index} を修正しました：\n"
+            f"- 勝者: {old_winner or '未設定'} → **{new_winner}**\n"
+            f"- ステージ: \"{old_stage}\" → \"{new_stage}\"")
 
 async def _finish_session(db, session_id: int) -> str:
     sess = await db.get(GameSession, session_id)
@@ -552,6 +601,197 @@ async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
             await _post_to_room_channel(inter, room, room_msg)
             await inter.response.send_message("結果と次試合を部屋チャンネルへ投稿しました。", ephemeral=True)
 
+class UndoModal(ui.Modal, title="最新試合の結果を修正"):
+    def __init__(self, session_id: int, match_id: int, room_label: str,
+                 current_winner: Optional[str], current_stage: str):
+        super().__init__(timeout=180)
+        self.session_id = session_id
+        self.match_id = match_id
+        self.room_label = room_label
+
+        self.winner_input = ui.TextInput(
+            label="勝利チーム（A または B）",
+            placeholder="A または B",
+            default=current_winner or "",
+            required=True,
+            max_length=1,
+        )
+        self.stage_input = ui.TextInput(
+            label="ステージ名",
+            placeholder="例）Museum d'Alfonsino",
+            default=current_stage or "",
+            required=False,
+            max_length=64,
+        )
+        self.add_item(self.winner_input)
+        self.add_item(self.stage_input)
+
+    async def on_submit(self, inter: Interaction):
+        async with SessionLocal() as db:
+            # 1) 対象試合の取得と結果修正（wins差分も反映）
+            m = await db.get(Match, self.match_id)
+            if not m:
+                await inter.response.send_message("対象の試合が見つかりませんでした。", ephemeral=True)
+                return
+
+            msg_edit = await _apply_match_edit(db, m, self.winner_input.value, self.stage_input.value)
+
+            # 2) 10勝到達チェック
+            ten = await db.scalar(
+                select(SessionStat).where(
+                    and_(SessionStat.session_id == self.session_id, SessionStat.wins >= 10)
+                )
+            )
+
+            if ten:
+                # (a) 10勝 → 自動終了
+                finish_msg = await _finish_session(db, self.session_id)
+                room_msg = (
+                    f"📢 **結果修正通知**\n"
+                    f"Session {self.session_id} / Match #{m.match_index}\n"
+                    f"勝者: {self.winner_input.value.upper()} / "
+                    f"ステージ: {self.stage_input.value or '（未設定）'}\n"
+                    f"(by {inter.user.mention})\n\n"
+                    f"誰かが **10勝** に到達！\n{finish_msg}"
+                )
+                await _post_to_room_channel(inter, self.room_label, room_msg)
+                await inter.response.send_message(
+                    f"{msg_edit}\nセッションを終了しました（10勝到達）。",
+                    ephemeral=True
+                )
+                return
+
+            # (b) 未到達 → 未確定Matchを“最新の1件だけ”掃除してから次試合を生成
+            pending = await db.scalar(
+                select(Match)
+                .where(and_(Match.session_id == self.session_id, Match.winner == None))
+                .order_by(desc(Match.match_index))
+            )
+            if pending:
+                await db.delete(pending)
+                await db.commit()
+
+            # 次試合のチーム編成とレコード生成
+            next_msg = await _create_next_match_and_message(db, self.session_id)
+
+            # 部屋チャンネルへ告知（この上は従来どおり）
+            room_msg = (
+                f"📢 **結果修正通知**\n"
+                f"Session {self.session_id} / Match #{m.match_index}\n"
+                f"勝者: {self.winner_input.value.upper()} / "
+                f"ステージ: {self.stage_input.value or '（未設定）'}\n"
+                f"(by {inter.user.mention})\n\n"
+                f"{next_msg}"
+            )
+            await _post_to_room_channel(inter, self.room_label, room_msg)
+
+            await inter.response.send_message(
+                f"{msg_edit}\n次試合を部屋チャンネルへ投稿しました。",
+                ephemeral=True
+            )
+
+@bot.tree.command(description="最新の試合結果を修正")
+async def undo(inter: Interaction, session_id: int):
+    async with SessionLocal() as db:
+        # 最新試合を取得
+        latest = await db.scalar(
+            select(Match)
+            .where(Match.session_id == session_id)
+            .order_by(desc(Match.match_index))
+        )
+        if not latest:
+            await inter.response.send_message("このセッションには試合がありません。", ephemeral=True)
+            return
+
+        # セッション情報を取得して room_label を取得
+        sess = await db.get(GameSession, session_id)
+        room_label = sess.room_label if sess else "?"
+
+        # 現在の結果を表示
+        info = (
+            f"セッション {session_id} の最新試合は **#{latest.match_index}** です。\n"
+            f"勝者: {latest.winner or '未設定'} / ステージ: {latest.stage or ''}\n\n"
+            f"この内容を修正します。新しい値を入力してください。"
+        )
+        await inter.response.send_message(info, ephemeral=True)
+
+        # モーダルを開く
+        modal = UndoModal(
+            session_id=session_id,
+            match_id=latest.id,
+            room_label=room_label,
+            current_winner=latest.winner,
+            current_stage=latest.stage or "",
+        )
+        await inter.followup.send_modal(modal)
+
+# -------------------------
+# 任意の試合番号の結果を修正：/modify
+# -------------------------
+
+class ModifyModal(ui.Modal, title="指定試合の結果を修正"):
+    def __init__(self, session_id: int, match_id: int, match_index: int,
+                 current_winner: Optional[str], current_stage: str):
+        super().__init__(timeout=180)
+        self.session_id = session_id
+        self.match_id = match_id
+        self.match_index = match_index
+
+        self.winner_input = ui.TextInput(
+            label="勝利チーム（A または B）",
+            placeholder="A または B",
+            default=current_winner or "",
+            required=True,
+            max_length=1
+        )
+        self.stage_input = ui.TextInput(
+            label="ステージ名",
+            placeholder="例）Museum d'Alfonsino",
+            default=current_stage or "",
+            required=False,
+            max_length=64
+        )
+        self.add_item(self.winner_input)
+        self.add_item(self.stage_input)
+
+    async def on_submit(self, inter: Interaction):
+        async with SessionLocal() as db:
+            m = await db.get(Match, self.match_id)
+            if not m:
+                await inter.response.send_message("対象の試合が見つかりませんでした。", ephemeral=True)
+                return
+            msg = await _apply_match_edit(db, m, self.winner_input.value, self.stage_input.value)
+            await inter.response.send_message(
+                f"セッション {self.session_id} / Match #{self.match_index}\n{msg}",
+                ephemeral=True
+            )
+
+
+@bot.tree.command(description="指定した試合番号の結果を修正（管理者）")
+@commands.has_permissions(manage_guild=True)
+async def modify(inter: Interaction, session_id: int, match_index: int):
+    async with SessionLocal() as db:
+        m = await db.scalar(
+            select(Match)
+            .where(and_(Match.session_id == session_id, Match.match_index == match_index))
+        )
+        if not m:
+            await inter.response.send_message("指定の試合が見つかりません。", ephemeral=True)
+            return
+
+        # 現状を表示
+        info = (f"セッション {session_id} / 試合 **#{match_index}** の現在の結果:\n"
+                f"勝者: {m.winner or '未設定'} / ステージ: {m.stage or ''}\n\n"
+                f"この内容を修正します。新しい値を入力してください。")
+        await inter.response.send_message(info, ephemeral=True)
+
+        # モーダルを開いて入力を受け付ける
+        modal = ModifyModal(session_id=session_id,
+                            match_id=m.id,
+                            match_index=match_index,
+                            current_winner=m.winner,
+                            current_stage=m.stage or "")
+        await inter.followup.send_modal(modal)
 
 @bot.tree.command(description="リーダーボードを表示")
 async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
