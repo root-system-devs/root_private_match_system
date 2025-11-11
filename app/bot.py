@@ -275,7 +275,26 @@ class RegisterView(ui.View):
 
     @ui.button(label="登録", style=discord.ButtonStyle.primary, custom_id="register:primary")
     async def do_register(self, inter: Interaction, button: ui.Button):
-        # 初期レート入力モーダルを開く（DB更新は on_submit 内で実施）
+        async with SessionLocal() as db:
+            # ユーザー確保
+            user = await ensure_user(db, inter.user)
+            # アクティブシーズン取得
+            season = await get_active_season(db)
+
+            if season:
+                # すでにシーズン参加者か？
+                existed_participant = await db.scalar(
+                    select(SeasonParticipant).where(
+                        and_(SeasonParticipant.season_id == season.id,
+                             SeasonParticipant.user_id   == user.id)
+                    )
+                )
+                if existed_participant:
+                    # 既に登録済み → モーダルは出さずに終了
+                    await inter.response.send_message("すでに登録済みです。", ephemeral=True)
+                    return
+
+        # ここまで来たら未参加 or アクティブシーズンなし → XP入力モーダルを表示
         await inter.response.send_modal(XpModal())
 
 class XpModal(ui.Modal, title="XPを入力"):
@@ -407,9 +426,10 @@ async def register(inter: Interaction):
         embed=discord.Embed(title="リーグ登録", description="下のボタンから登録してください。"),
         view=RegisterView()
     )
-    # 実行者にはエフェメラルで通知
-    await inter.response.send_message("登録ボタンを表示しました。", ephemeral=True)
-
+    await inter.response.send_message(
+        f"登録ボタンを表示しました。",
+        ephemeral=True
+    )
 
 @bot.tree.command(description="アクティブシーズンを作成（管理者）")
 @commands.has_permissions(manage_guild=True)
@@ -478,7 +498,7 @@ class EntryView(ui.View):
                 )
                 return
 
-            # 🔸 シーズン参加者チェック（登録済みか？）
+            # シーズン参加者チェック
             is_participant = await db.scalar(
                 select(SeasonParticipant).where(
                     and_(
@@ -493,42 +513,61 @@ class EntryView(ui.View):
                     "ピン留めされたメッセージにある登録ボタンを押してください。",
                     ephemeral=True,
                 )
-                return  # ← ここで終了（以下の処理はスキップ）
+                return
 
-            # ここから先は既存のエントリー処理
+            # 参加処理
             sess = await ensure_pending_session(db, season.id, self.week)
-            existed = await db.scalar(
+            ent = await db.scalar(
                 select(Entry).where(
-                    and_(
-                        Entry.session_id == sess.id,
-                        Entry.user_id == user.id,
-                    )
+                    and_(Entry.session_id == sess.id, Entry.user_id == user.id)
                 )
             )
 
-            if not existed:
+            if not ent:
+                # 初回参加
                 db.add(Entry(session_id=sess.id, user_id=user.id, status="confirmed"))
+
                 score = await db.scalar(
                     select(SeasonScore).where(
-                        and_(
-                            SeasonScore.season_id == season.id,
-                            SeasonScore.user_id == user.id,
-                        )
+                        and_(SeasonScore.season_id == season.id,
+                             SeasonScore.user_id == user.id)
                     )
                 )
                 if not score:
                     score = SeasonScore(
-                        season_id=season.id,
-                        user_id=user.id,
-                        entry_points=0.0,
-                        win_points=0,
+                        season_id=season.id, user_id=user.id,
+                        entry_points=0.0, win_points=0
                     )
                     db.add(score)
                 score.entry_points += 0.5
                 await db.commit()
                 await inter.response.send_message("参加を受け付けました（+0.5pt）", ephemeral=True)
+
             else:
-                await inter.response.send_message("既に参加登録済みです。", ephemeral=True)
+                # 既にエントリーあり → ステータスで分岐
+                if ent.status == "canceled":
+                    # 再参加：confirmed に戻して +0.5pt
+                    ent.status = "confirmed"
+                    score = await db.scalar(
+                        select(SeasonScore).where(
+                            and_(SeasonScore.season_id == season.id,
+                                 SeasonScore.user_id == user.id)
+                        )
+                    )
+                    if not score:
+                        score = SeasonScore(
+                            season_id=season.id, user_id=user.id,
+                            entry_points=0.0, win_points=0
+                        )
+                        db.add(score)
+                    score.entry_points += 0.5
+                    await db.commit()
+                    await inter.response.send_message("再参加を受け付けました（+0.5pt）", ephemeral=True)
+                elif ent.status == "confirmed":
+                    await inter.response.send_message("既に参加登録済みです。", ephemeral=True)
+                else:
+                    # 他ステータス（waitlist など）を念のため考慮
+                    await inter.response.send_message(f"現在の状態: {ent.status}", ephemeral=True)
     
     @ui.button(label="キャンセル", style=discord.ButtonStyle.danger)
     async def cancel(self, inter: Interaction, button: ui.Button):
