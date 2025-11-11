@@ -11,9 +11,9 @@ import discord
 from discord import app_commands, ui, Interaction
 from discord.ext import commands
 from datetime import datetime, timezone
-from sqlalchemy import select, and_, func, desc, delete, update
+from sqlalchemy import select, and_, or_, func, desc, delete, update
 from .db import SessionLocal, init_models
-from .models import User, Season, Session as GameSession, Entry, SessionStat, SessionSettlement, SeasonScore, Match, SeasonParticipant
+from .models import User, Season, EntryBox, EntryApplication, Session as GameSession, Entry, SessionStat, SessionSettlement, SeasonScore, Match, SeasonParticipant
 from .team_balance import split_4v4_min_diff
 from typing import Optional
 
@@ -64,6 +64,22 @@ async def ensure_user(db, member: discord.abc.User):
 async def get_active_season(db):
     s = await db.scalar(select(Season).where(Season.is_active == True))
     return s
+
+async def ensure_entry_box(db, season_id: int, week: int) -> EntryBox:
+    box = await db.scalar(
+        select(EntryBox).where(
+            and_(
+                EntryBox.season_id == season_id,
+                EntryBox.week_number == week,
+            )
+        )
+    )
+    if not box:
+        box = EntryBox(season_id=season_id, week_number=week, status="open")
+        db.add(box)
+        await db.commit()
+        await db.refresh(box)
+    return box
 
 # 現在待ち状態(PENDING)のセッションを取得、なければ作成
 async def ensure_pending_session(db, season_id: int, week: int):
@@ -586,7 +602,6 @@ async def create_season(inter: Interaction, name: str):
 
 
 @bot.tree.command(description="今週の参加告知を出す（管理者）")
-@commands.has_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def announce(inter: Interaction, week: int):
     async with SessionLocal() as db:
@@ -594,8 +609,16 @@ async def announce(inter: Interaction, week: int):
         if not season:
             await inter.response.send_message("アクティブなシーズンがありません。/create_season で作成してください。", ephemeral=True)
             return
-        await ensure_pending_session(db, season.id, week)
-    await inter.channel.send(embed=discord.Embed(title=f"Week {week} 参加募集", description="下のボタンで参加/キャンセル。締切まで変更可。"), view=EntryView(week))
+        # 募集箱を用意する（なければ作る）
+        await ensure_entry_box(db, season.id, week)
+
+    await inter.channel.send(
+        embed=discord.Embed(
+            title=f"Week {week} 参加募集",
+            description="下のボタンで参加/キャンセル。締切まで変更可。"
+        ),
+        view=EntryView(week)
+    )
     await inter.response.send_message("告知を出しました。", ephemeral=True)
 
 class EntryView(ui.View):
@@ -608,15 +631,27 @@ class EntryView(ui.View):
         async with SessionLocal() as db:
             user = await ensure_user(db, inter.user)
             season = await get_active_season(db)
-
             if not season:
+                await inter.response.send_message("現在アクティブなシーズンがありません。", ephemeral=True)
+                return
+
+            # 募集箱を探す（なければ締め切り扱い）
+            box = await db.scalar(
+                select(EntryBox).where(
+                    and_(
+                        EntryBox.season_id == season.id,
+                        EntryBox.week_number == self.week,
+                    )
+                )
+            )
+            if not box or box.status != "open":
                 await inter.response.send_message(
-                    "現在アクティブなシーズンがありません。管理者に確認してください。",
+                    f"Week {self.week} の募集は締め切られています。",
                     ephemeral=True,
                 )
                 return
 
-            # シーズン参加者チェック
+            # シーズン参加者チェック（元のまま）
             is_participant = await db.scalar(
                 select(SeasonParticipant).where(
                     and_(
@@ -627,122 +662,152 @@ class EntryView(ui.View):
             )
             if not is_participant:
                 await inter.response.send_message(
-                    f"{inter.user.mention} さんはまだシーズン{season.name}の参加者ではありません。\n"
-                    "ピン留めされたメッセージにある登録ボタンを押してください。",
+                    f"{inter.user.mention} さんはまだシーズン{season.name}の参加者ではありません。",
                     ephemeral=True,
                 )
                 return
 
-            # 参加処理
-            sess = await ensure_pending_session(db, season.id, self.week)
+            # この募集箱でのエントリを探す/作る
             ent = await db.scalar(
-                select(Entry).where(
-                    and_(Entry.session_id == sess.id, Entry.user_id == user.id)
+                select(EntryApplication).where(
+                    and_(
+                        EntryApplication.entry_box_id == box.id,
+                        EntryApplication.user_id == user.id,
+                    )
                 )
             )
-
             if not ent:
-                # 初回参加
-                db.add(Entry(session_id=sess.id, user_id=user.id, status="confirmed"))
+                ent = EntryApplication(entry_box_id=box.id, user_id=user.id, status="confirmed")
+                db.add(ent)
 
+                # 参加ポイント加算（SeasonScoreは元の流れに合わせておく）
                 score = await db.scalar(
                     select(SeasonScore).where(
-                        and_(SeasonScore.season_id == season.id,
-                             SeasonScore.user_id == user.id)
+                        and_(SeasonScore.season_id == season.id, SeasonScore.user_id == user.id)
                     )
                 )
                 if not score:
                     score = SeasonScore(
-                        season_id=season.id, user_id=user.id,
-                        entry_points=0.0, win_points=0
+                        season_id=season.id,
+                        user_id=user.id,
+                        entry_points=0.0,
+                        win_points=0,
                     )
                     db.add(score)
                 score.entry_points += 0.5
                 await db.commit()
                 await inter.response.send_message("参加を受け付けました（+0.5pt）", ephemeral=True)
-
             else:
-                # 既にエントリーあり → ステータスで分岐
                 if ent.status == "canceled":
-                    # 再参加：confirmed に戻して +0.5pt
                     ent.status = "confirmed"
                     score = await db.scalar(
                         select(SeasonScore).where(
-                            and_(SeasonScore.season_id == season.id,
-                                 SeasonScore.user_id == user.id)
+                            and_(SeasonScore.season_id == season.id, SeasonScore.user_id == user.id)
                         )
                     )
                     if not score:
                         score = SeasonScore(
-                            season_id=season.id, user_id=user.id,
-                            entry_points=0.0, win_points=0
+                            season_id=season.id,
+                            user_id=user.id,
+                            entry_points=0.0,
+                            win_points=0,
                         )
                         db.add(score)
                     score.entry_points += 0.5
                     await db.commit()
                     await inter.response.send_message("再参加を受け付けました（+0.5pt）", ephemeral=True)
-                elif ent.status == "confirmed":
-                    await inter.response.send_message("既に参加登録済みです。", ephemeral=True)
                 else:
-                    # 他ステータス（waitlist など）を念のため考慮
-                    await inter.response.send_message(f"現在の状態: {ent.status}", ephemeral=True)
-    
+                    await inter.response.send_message("既に参加登録済みです。", ephemeral=True)
+
     @ui.button(label="キャンセル", style=discord.ButtonStyle.danger)
     async def cancel(self, inter: Interaction, button: ui.Button):
         async with SessionLocal() as db:
             user = await ensure_user(db, inter.user)
             season = await get_active_season(db)
-            sess = await ensure_pending_session(db, season.id, self.week)
-            ent = await db.scalar(select(Entry).where(and_(Entry.session_id==sess.id, Entry.user_id==user.id)))
-            if ent:
-                if ent.status == "confirmed":
-                    ent.status = "canceled"
-                    score = await db.scalar(select(SeasonScore).where(and_(SeasonScore.season_id==season.id, SeasonScore.user_id==user.id)))
-                    if score:
-                        score.entry_points -= 0.5
-                    await db.commit()
-                    await inter.response.send_message("キャンセルしました（-0.5pt）。", ephemeral=True)
-                else:
-                    await inter.response.send_message("既にキャンセル済みです。", ephemeral=True)
-            else:
-                await inter.response.send_message("参加登録が見つかりません。", ephemeral=True)
+            # 募集箱が閉じていたらキャンセルも不可
+            box = await db.scalar(
+                select(EntryBox).where(
+                    and_(
+                        EntryBox.season_id == season.id,
+                        EntryBox.week_number == self.week,
+                    )
+                )
+            )
+            if not box or box.status != "open":
+                await inter.response.send_message(
+                    f"Week {self.week} の募集は締め切られているため、ここからは変更できません。",
+                    ephemeral=True,
+                )
+                return
 
+            ent = await db.scalar(
+                select(EntryApplication).where(
+                    and_(
+                        EntryApplication.entry_box_id == box.id,
+                        EntryApplication.user_id == user.id,
+                    )
+                )
+            )
+            if ent and ent.status == "confirmed":
+                ent.status = "canceled"
+                score = await db.scalar(
+                    select(SeasonScore).where(
+                        and_(SeasonScore.season_id == season.id, SeasonScore.user_id == user.id)
+                    )
+                )
+                if score:
+                    score.entry_points -= 0.5
+                await db.commit()
+                await inter.response.send_message("キャンセルしました（-0.5pt）。", ephemeral=True)
+            else:
+                await inter.response.send_message("参加登録が見つからないか、すでにキャンセル済みです。", ephemeral=True)
 
 @bot.tree.command(description="締切：優先度→先着→レート順で部屋確定（管理者）")
-@commands.has_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def close_entries(inter: Interaction, week: int):
     async with SessionLocal() as db:
         season = await get_active_season(db)
-        pending = await ensure_pending_session(db, season.id, week)
+        # 募集箱を取る（無かったらそもそも募集してない）
+        box = await db.scalar(
+            select(EntryBox).where(
+                and_(
+                    EntryBox.season_id == season.id,
+                    EntryBox.week_number == week,
+                )
+            )
+        )
+        if not box:
+            await inter.response.send_message("この週の募集箱が見つかりません。", ephemeral=True)
+            return
+        if box.status != "open":
+            await inter.response.send_message("この週はすでに締め切られています。", ephemeral=True)
+            return
 
+        # 募集箱の confirmed を全部取る
         rows = await db.execute(
             select(
-                Entry.user_id,
-                Entry.created_at,
+                EntryApplication.user_id,
+                EntryApplication.created_at,
                 User.priority,
                 User.xp,
                 User.discord_user_id,
                 User.display_name,
             )
-            .join(User, User.id == Entry.user_id)
+            .join(User, User.id == EntryApplication.user_id)
             .where(
-                Entry.session_id == pending.id,
-                Entry.status == "confirmed",
+                EntryApplication.entry_box_id == box.id,
+                EntryApplication.status == "confirmed",
             )
         )
         records = list(rows.all())
 
-        # === 8人未満の場合（SESSION_MEMBER_NUMを使用） ===
+        # 人数チェック（SESSION_MEMBER_NUMはすでに定義済みの想定）
         if len(records) < SESSION_MEMBER_NUM:
-            # セッションをキャンセル扱いに変更
-            await db.execute(
-                update(GameSession)
-                .where(GameSession.id == pending.id)
-                .values(status="canceled", room_label="CANCELED")
-            )
+            # 募集箱をキャンセル扱いにする
+            box.status = "canceled"
+            await db.commit()
 
-            # priorityを+1
+            # 応募していた人のpriority +1
             for (uid, _ts, prio, _xp, discord_uid, disp) in records:
                 await db.execute(
                     update(User).where(User.id == uid).values(priority=prio + 1)
@@ -752,19 +817,14 @@ async def close_entries(inter: Interaction, week: int):
             mentions = ", ".join(
                 f"{disp}(<@{discord_uid}>)" for (_uid, _ts, _prio, _xp, discord_uid, disp) in records
             )
-
-            msg = (
-                f"Week {week} の参加希望者が{SESSION_MEMBER_NUM}人未満だったため、"
-                f"セッションを **キャンセル** しました。\n"
-                f"以下のメンバーの **優先度を +1** しました: {mentions}"
-                if records else
-                f"Week {week} の参加希望者が{SESSION_MEMBER_NUM}人未満だったため、"
-                f"セッションを **キャンセル** しました。"
+            await inter.response.send_message(
+                f"Week {week} の参加希望者が{SESSION_MEMBER_NUM}人未満だったため、募集をキャンセルしました。\n"
+                f"優先度を+1したメンバー: {mentions}",
+                ephemeral=False,
             )
-            await inter.response.send_message(msg, ephemeral=False)
             return
 
-        # === 優先度順・先着順・レート順での選抜 ===
+        # 以降は今までと同じ「優先度→先着→レート」で切る処理
         records.sort(key=lambda r: (-r.priority, r.created_at))
         num_take = (len(records) // SESSION_MEMBER_NUM) * SESSION_MEMBER_NUM
         selected = records[:num_take]
@@ -780,7 +840,7 @@ async def close_entries(inter: Interaction, week: int):
         if dropped:
             await db.commit()
 
-        # 選抜者 priority = 0 にリセット
+        # 選抜者 priority = 0
         if selected:
             await db.execute(
                 update(User)
@@ -789,11 +849,9 @@ async def close_entries(inter: Interaction, week: int):
             )
             await db.commit()
 
-        # レート降順で並べ替え
+        # レート順に並べてから分割
         selected.sort(key=lambda r: (-r.xp, r.created_at))
         selected_ids = [r.user_id for r in selected]
-
-        # SESSION_MEMBER_NUM単位で分割
         chunks = [selected_ids[i:i+SESSION_MEMBER_NUM] for i in range(0, len(selected_ids), SESSION_MEMBER_NUM)]
         summary_msgs = []
 
@@ -802,7 +860,6 @@ async def close_entries(inter: Interaction, week: int):
                 break
 
             room = ROOM_LABELS[idx]
-
             sess = GameSession(
                 season_id=season.id,
                 week_number=week,
@@ -813,10 +870,12 @@ async def close_entries(inter: Interaction, week: int):
             db.add(sess)
             await db.commit(); await db.refresh(sess)
 
+            # ここで“本番用のEntry”を今まで通り作る（部屋の参加メンバーとして）
             for uid in chunk:
                 db.add(Entry(session_id=sess.id, user_id=uid, status="confirmed"))
             await db.commit()
 
+            # あとは既存と同じでOK
             await init_session_stats(db, sess.id, chunk)
             start_msg = await _start_session(db, sess.id)
             next_msg = await _create_next_match_and_message(db, sess.id)
@@ -832,24 +891,21 @@ async def close_entries(inter: Interaction, week: int):
                 f"参加者: {mentions}\n\n"
                 f"{next_msg}"
             )
-
             await _post_to_room_channel(inter, room, msg)
             summary_msgs.append(f"部屋 {room} を開始し、チームを発表しました。")
 
-        if not inter.response.is_done():
-            await inter.response.send_message("\n".join(summary_msgs), ephemeral=False)
-        else:
-            await inter.followup.send("\n".join(summary_msgs), ephemeral=False)
+        # 募集箱を締め切り
+        box.status = "closed"
+        await db.commit()
+
+        await inter.response.send_message("\n".join(summary_msgs), ephemeral=False)
 
         if dropped_mentions:
-            try:
-                await inter.followup.send(
-                    f"{SESSION_MEMBER_NUM}人に満たず見送りとなったメンバー（priority +1 済み）: "
-                    + ", ".join(dropped_mentions),
-                    ephemeral=False
-                )
-            except Exception:
-                pass
+            await inter.followup.send(
+                f"{SESSION_MEMBER_NUM}人に満たず見送りとなったメンバー（priority +1 済み）: "
+                + ", ".join(dropped_mentions),
+                ephemeral=False
+            )
             
 
 
@@ -1064,11 +1120,81 @@ async def undo(inter: Interaction, session_id: int):
             await inter.response.send_message("このセッションには試合がありません。", ephemeral=True)
             return
 
-        # room_label 取得
+        # 対象セッションを取得
         sess = await db.get(GameSession, session_id)
+        if not sess:
+            await inter.response.send_message("セッションが見つかりません。", ephemeral=True)
+            return
+
+        # このセッションが属するシーズン
+        season = await db.scalar(
+            select(Season).where(Season.id == sess.season_id)
+        )
+        if not season:
+            await inter.response.send_message("シーズンが見つかりません。", ephemeral=True)
+            return
+
+        # このセッションに参加していたユーザIDを取得（confirmed のみ）
+        entry_rows = await db.execute(
+            select(Entry.user_id)
+            .where(and_(Entry.session_id == session_id, Entry.status == "confirmed"))
+        )
+        session_user_ids = [r[0] for r in entry_rows.all()]
+
+        # ここから「後続セッションでレートが動いていないか」をチェック
+        # 判定基準:
+        #   同じシーズン・同じユーザーで、
+        #   「このセッションより scheduled_at が後」または「同時刻で session_id が大きい」Session の Settlement で
+        #   rate_delta が 0 でないものがあったらアウト
+        # つまり “このセッション時点のレート != 現在のレート” とみなす
+
+        # 対象セッションの時刻/IDを固定しておく
+        target_ts = sess.scheduled_at
+        target_sid = sess.id
+
+        inconsistent = False
+        bad_users: list[int] = []
+
+        for uid in session_user_ids:
+            later_delta_row = await db.execute(
+                select(func.sum(SessionSettlement.rate_delta))
+                .join(GameSession, GameSession.id == SessionSettlement.session_id)
+                .where(
+                    SessionSettlement.season_id == season.id,
+                    SessionSettlement.user_id == uid,
+                    or_(
+                        GameSession.scheduled_at > target_ts,
+                        and_(GameSession.scheduled_at == target_ts, GameSession.id > target_sid),
+                    )
+                )
+            )
+            later_sum = later_delta_row.scalar() or 0.0
+            # ほんの少しの浮動小数誤差は許す
+            if abs(later_sum) > 1e-6:
+                inconsistent = True
+                bad_users.append(uid)
+
+        if inconsistent:
+            # 誰かが次の週でレートを動かしているのでこのundoは危険
+            # メンションできるようにDiscord IDも引いておく
+            bad_discords = []
+            for uid in bad_users:
+                u = await db.scalar(select(User).where(User.id == uid))
+                if u:
+                    bad_discords.append(f"{u.display_name}(<@{u.discord_user_id}>)")
+            users_text = ", ".join(bad_discords) if bad_discords else "一部参加者"
+
+            await inter.response.send_message(
+                f"このセッションの後に別の試合でレートが更新されている参加者がいるため、修正できません。\n"
+                f"修正期限切れなので管理者に連絡してください。\n"
+                f"該当: {users_text}",
+                ephemeral=True,
+            )
+            return
+
+        # ここまで通ったら「このセッション以降でレートが動いてない」ので安全にモーダルを出す
         room_label = sess.room_label if sess else "?"
 
-        # ここで “最初の応答” としてモーダルを表示する
         modal = UndoModal(
             session_id=session_id,
             match_id=target_match.id,
@@ -1077,7 +1203,6 @@ async def undo(inter: Interaction, session_id: int):
             current_stage=target_match.stage or "",
         )
         await inter.response.send_modal(modal)
-
 # -------------------------
 # 任意の試合番号の結果を修正：/modify
 # -------------------------

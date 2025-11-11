@@ -32,6 +32,27 @@ class SeasonParticipant(Base):
     user_id:   Mapped[int] = mapped_column(ForeignKey("users.id"),   primary_key=True, index=True)
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
+class EntryBox(Base):
+    __tablename__ = "entry_boxes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    season_id: Mapped[int] = mapped_column(ForeignKey("seasons.id"))
+    week_number: Mapped[int]
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open|closed|canceled
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EntryApplication(Base):
+    """
+    募集箱(EntryBox)に対する1人分の参加申請。
+    """
+    __tablename__ = "entry_applications"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    entry_box_id: Mapped[int] = mapped_column(ForeignKey("entry_boxes.id"), index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="confirmed")  # confirmed|canceled|waitlist
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Session(Base):
     __tablename__ = "sessions"
     id: Mapped[int] = mapped_column(primary_key=True)
