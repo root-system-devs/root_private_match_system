@@ -243,7 +243,7 @@ async def _finish_session(db, session_id: int) -> str:
     if sess.status == "finished":
         return f"Session {session_id} は既に終了済みです。"
 
-    # 該当セッションの全ユーザーの wins を取得
+    # セッションの勝利集計
     stats = (await db.execute(
         select(SessionStat).where(SessionStat.session_id == session_id)
     )).scalars().all()
@@ -252,21 +252,82 @@ async def _finish_session(db, session_id: int) -> str:
     if not season:
         return "アクティブなシーズンが見つかりません。"
 
-    # シーズン累計へ加算
-    for st in stats:
-        sc = await db.scalar(select(SeasonScore).where(
-            and_(SeasonScore.season_id == season.id, SeasonScore.user_id == st.user_id)
-        ))
-        if not sc:
-            sc = SeasonScore(season_id=season.id, user_id=st.user_id,
-                             entry_points=0.0, win_points=0)
+    # 参加者ID一覧
+    participant_ids = [st.user_id for st in stats]
+    if not participant_ids:
+        sess.status = "finished"
+        await db.commit()
+        return f"Session {session_id} を終了しました。（参加者なし）"
+
+    # 現在の SeasonScore をまとめて取得（無い人は作成）
+    score_rows = (await db.execute(
+        select(SeasonScore).where(
+            and_(SeasonScore.season_id == season.id, SeasonScore.user_id.in_(participant_ids))
+        )
+    )).scalars().all()
+    score_map = {sc.user_id: sc for sc in score_rows}
+
+    # Fallback: SeasonScoreが無い人はこのタイミングで作成（rateはUser.xp or 1000.0）
+    # ついでにUserも引いておく
+    user_rows = (await db.execute(
+        select(User).where(User.id.in_(participant_ids))
+    )).scalars().all()
+    user_map = {u.id: u for u in user_rows}
+
+    created_scores = []
+    for uid in participant_ids:
+        if uid not in score_map:
+            init_rate = (user_map.get(uid).xp if user_map.get(uid) else None) or 1000.0
+            sc = SeasonScore(
+                season_id=season.id, user_id=uid,
+                entry_points=0.0, win_points=0, rate=init_rate
+            )
             db.add(sc)
+            score_map[uid] = sc
+            created_scores.append(uid)
+
+    # 参加者の平均レートを計算
+    rates = [score_map[uid].rate for uid in participant_ids]
+    avg_rate = sum(rates) / len(rates) if rates else 1000.0
+
+    # セッション内の最大勝利数（通常は10）
+    wins_list = [int(st.wins) for st in stats]
+    max_wins = max(wins_list) if wins_list else 1  # div0回避
+
+    # ----暫定のレート更新式----
+    # 直感的な簡易式：
+    #   perf      = (自分の勝利率) - 0.5  （最大勝利の半分を基準に優劣）
+    #   diff_term = (平均レート - 自分のレート) / 400  （弱い人が勝てば上がりやすく、強い人は控えめ）
+    #   Δrate     = K * (perf + diff_term)
+    # 推奨Kは 20 前後
+    K = 20.0
+
+    def calc_delta_rate(user_rate: float, wins: int, avg_rate: float, max_wins: int) -> float:
+        # 試合数の多いセッションが有利にならないようにするため、勝率で計算
+        perf = (wins / max_wins) - 0.5
+        diff_term = (avg_rate - user_rate) / 400.0
+        return K * (perf + diff_term)
+    # -------------------------------------------------------------
+
+    # シーズン累計ポイント加算 + レート更新
+    for st in stats:
+        uid = st.user_id
+        sc = score_map[uid]
         sc.win_points += int(st.wins)
+
+        # レート更新
+        old_rate = float(sc.rate)
+        delta = calc_delta_rate(old_rate, int(st.wins), avg_rate, max_wins)
+        sc.rate = old_rate + delta
 
     # セッションを終了
     sess.status = "finished"
     await db.commit()
-    return f"Session {session_id} を終了し、当日の勝数をシーズンに加算しました。"
+
+    return (
+        f"Session {session_id} を終了し、当日の勝数をシーズンに加算しました。\n"
+        f"あわせてレートを更新しました。（平均レート: {avg_rate:.1f} / K={K:g}）"
+    )
 
 # ---- 永続ビュー ----
 class RegisterView(ui.View):
