@@ -11,9 +11,9 @@ import discord
 from discord import app_commands, ui, Interaction
 from discord.ext import commands
 from datetime import datetime, timezone
-from sqlalchemy import select, and_, func, desc, delete
+from sqlalchemy import select, and_, func, desc, delete, update
 from .db import SessionLocal, init_models
-from .models import User, Season, Session as GameSession, Entry, SessionStat, SeasonScore, Match, SeasonParticipant
+from .models import User, Season, Session as GameSession, Entry, SessionStat, SessionSettlement, SeasonScore, Match, SeasonParticipant
 from .team_balance import split_4v4_min_diff
 from typing import Optional
 
@@ -23,6 +23,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 ROOM_LABELS = list("123456789")
+# 1セッションあたりの人数（テストでは2や4に変更可能）
+SESSION_MEMBER_NUM = 2
 
 
 @bot.event
@@ -99,8 +101,9 @@ async def _post_to_room_channel(inter: Interaction, room_label: str, msg: str):
 
     # 共有の権限（必要に応じて調整）
     overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        guild.me: discord.PermissionOverwrite(read_messages=True, connect=True, speak=True),
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
+        # 送信:
+        guild.default_role: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
     }
 
     # 2) テキストチャンネル取得 or 作成
@@ -133,7 +136,7 @@ async def _post_to_room_channel(inter: Interaction, room_label: str, msg: str):
 async def get_session_players_with_wins(db, session_id: int):
 # entries→confirmedユーザーの wins を session_stats から取得
     ents = await list_entries(db, session_id)
-    uids = [e.user_id for e in ents][:8] # 8人に制限
+    uids = [e.user_id for e in ents][:SESSION_MEMBER_NUM] # 8人に制限
 # 初期化
     await init_session_stats(db, session_id, uids)
     stats_map = { (s.user_id): s.wins for s in (await db.execute(
@@ -150,7 +153,7 @@ async def _create_next_match_and_message(db, session_id: int) -> str:
         return f"Session {session_id} は既に終了済みです。"
 
     players = await get_session_players_with_wins(db, session_id)
-    if len(players) < 8:
+    if len(players) < SESSION_MEMBER_NUM:
         return "プレイヤーが8人揃っていません。"
 
     # バランス編成（playersは {user_id, wins} の配列を想定）
@@ -240,94 +243,131 @@ async def _finish_session(db, session_id: int) -> str:
     sess = await db.get(GameSession, session_id)
     if not sess:
         return "セッションが見つかりません。"
-    if sess.status == "finished":
-        return f"Session {session_id} は既に終了済みです。"
-
-    # セッションの勝利集計
-    stats = (await db.execute(
-        select(SessionStat).where(SessionStat.session_id == session_id)
-    )).scalars().all()
 
     season = await get_active_season(db)
     if not season:
         return "アクティブなシーズンが見つかりません。"
 
-    # 参加者ID一覧
-    participant_ids = [st.user_id for st in stats]
-    if not participant_ids:
+    # --- ① 既存の精算があれば巻き戻す ---
+    previous_settlements = (await db.execute(
+        select(SessionSettlement).where(
+            and_(SessionSettlement.season_id == season.id,
+                 SessionSettlement.session_id == session_id)
+        )
+    )).scalars().all()
+
+    for stl in previous_settlements:
+        sc = await db.scalar(select(SeasonScore).where(
+            and_(SeasonScore.season_id == season.id,
+                 SeasonScore.user_id   == stl.user_id)
+        ))
+        if sc:
+            sc.win_points = int(sc.win_points) - int(stl.win_delta)
+            sc.rate       = float(sc.rate)     - float(stl.rate_delta)
+        # 履歴は削除（置き換え前提）
+        await db.delete(stl)
+    if previous_settlements:
+        await db.commit()
+
+    # --- ② 最新のセッション成績を取得 ---
+    stats = (await db.execute(
+        select(SessionStat).where(SessionStat.session_id == session_id)
+    )).scalars().all()
+
+    if not stats:
+        # 参加者なし：ステータスのみ更新（巻き戻し済みならそのまま）
         sess.status = "finished"
         await db.commit()
         return f"Session {session_id} を終了しました。（参加者なし）"
 
-    # 現在の SeasonScore をまとめて取得（無い人は作成）
+    participant_ids = [st.user_id for st in stats]
+
+    # SeasonScore / User を用意
     score_rows = (await db.execute(
         select(SeasonScore).where(
-            and_(SeasonScore.season_id == season.id, SeasonScore.user_id.in_(participant_ids))
+            and_(SeasonScore.season_id == season.id,
+                 SeasonScore.user_id.in_(participant_ids))
         )
     )).scalars().all()
-    score_map = {sc.user_id: sc for sc in score_rows}
+    score_map = {s.user_id: s for s in score_rows}
 
-    # Fallback: SeasonScoreが無い人はこのタイミングで作成（rateはUser.xp or 1000.0）
-    # ついでにUserも引いておく
-    user_rows = (await db.execute(
-        select(User).where(User.id.in_(participant_ids))
-    )).scalars().all()
-    user_map = {u.id: u for u in user_rows}
+    users = (await db.execute(select(User).where(User.id.in_(participant_ids)))).scalars().all()
+    user_map = {u.id: u for u in users}
 
-    created_scores = []
+    # SeasonScore が無い人は初期化（rate は xp or 1000）
     for uid in participant_ids:
         if uid not in score_map:
             init_rate = (user_map.get(uid).xp if user_map.get(uid) else None) or 1000.0
-            sc = SeasonScore(
-                season_id=season.id, user_id=uid,
-                entry_points=0.0, win_points=0, rate=init_rate
-            )
+            sc = SeasonScore(season_id=season.id, user_id=uid,
+                             entry_points=0.0, win_points=0, rate=init_rate)
             db.add(sc)
             score_map[uid] = sc
-            created_scores.append(uid)
+    await db.commit()
 
-    # 参加者の平均レートを計算
+    # 平均レート / 最大勝数
     rates = [score_map[uid].rate for uid in participant_ids]
-    avg_rate = sum(rates) / len(rates) if rates else 1000.0
+    avg_rate = sum(rates)/len(rates) if rates else 1000.0
+    max_wins = max(int(s.wins) for s in stats) if stats else 1
 
-    # セッション内の最大勝利数（通常は10）
-    wins_list = [int(st.wins) for st in stats]
-    max_wins = max(wins_list) if wins_list else 1  # div0回避
-
-    # ----暫定のレート更新式----
-    # 直感的な簡易式：
-    #   perf      = (自分の勝利率) - 0.5  （最大勝利の半分を基準に優劣）
-    #   diff_term = (平均レート - 自分のレート) / 400  （弱い人が勝てば上がりやすく、強い人は控えめ）
-    #   Δrate     = K * (perf + diff_term)
-    # 推奨Kは 20 前後
+    # 暫定レート式
     K = 20.0
-
     def calc_delta_rate(user_rate: float, wins: int, avg_rate: float, max_wins: int) -> float:
-        # 試合数の多いセッションが有利にならないようにするため、勝率で計算
         perf = (wins / max_wins) - 0.5
         diff_term = (avg_rate - user_rate) / 400.0
         return K * (perf + diff_term)
-    # -------------------------------------------------------------
 
-    # シーズン累計ポイント加算 + レート更新
+    # --- ③ 最新の結果で再精算し、履歴を記録 ---
     for st in stats:
         uid = st.user_id
-        sc = score_map[uid]
-        sc.win_points += int(st.wins)
+        sc  = score_map[uid]
 
-        # レート更新
-        old_rate = float(sc.rate)
-        delta = calc_delta_rate(old_rate, int(st.wins), avg_rate, max_wins)
-        sc.rate = old_rate + delta
+        win_delta  = int(st.wins)                     # 今セッションでの勝数加算
+        rate_delta = float(calc_delta_rate(sc.rate, int(st.wins), avg_rate, max_wins))
 
-    # セッションを終了
+        sc.win_points += win_delta
+        sc.rate       += rate_delta
+
+        db.add(SessionSettlement(
+            season_id=season.id, session_id=session_id, user_id=uid,
+            win_delta=win_delta, rate_delta=rate_delta
+        ))
+
+    # セッション終了（※ undo で減って10未満になったら live に戻す仕様にするなら、ここは呼ぶ側で制御）
     sess.status = "finished"
     await db.commit()
 
-    return (
-        f"Session {session_id} を終了し、当日の勝数をシーズンに加算しました。\n"
-        f"あわせてレートを更新しました。（平均レート: {avg_rate:.1f} / K={K:g}）"
-    )
+    return (f"Session {session_id} を終了し、当日の勝数・レートを精算しました。"
+            f"（平均レート: {avg_rate:.1f}, K={K:g}）")
+
+async def _reopen_session_if_finished(db, session_id: int):
+    sess = await db.get(GameSession, session_id)
+    if not sess or sess.status != "finished":
+        return
+    season = await get_active_season(db)
+    if not season:
+        return
+
+    settlements = (await db.execute(
+        select(SessionSettlement).where(
+            and_(
+                SessionSettlement.season_id == season.id,
+                SessionSettlement.session_id == session_id,
+            )
+        )
+    )).scalars().all()
+
+    for stl in settlements:
+        sc = await db.scalar(select(SeasonScore).where(
+            and_(SeasonScore.season_id == season.id,
+                 SeasonScore.user_id   == stl.user_id)
+        ))
+        if sc:
+            sc.win_points -= int(stl.win_delta)
+            sc.rate       -= float(stl.rate_delta)
+        await db.delete(stl)
+
+    sess.status = "live"
+    await db.commit()
 
 # ---- 永続ビュー ----
 class RegisterView(ui.View):
@@ -481,6 +521,7 @@ class XpModal(ui.Modal, title="XPを入力"):
 # ========== コマンド ==========
 @bot.tree.command(description="リーグに登録（管理者）")
 @commands.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 async def register(inter: Interaction):
     # メッセージに「登録」ボタンを表示
     await inter.channel.send(
@@ -494,6 +535,7 @@ async def register(inter: Interaction):
 
 @bot.tree.command(description="アクティブシーズンを作成（管理者）")
 @commands.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 async def create_season(inter: Interaction, name: str):
     async with SessionLocal() as db:
         now = datetime.now(timezone.utc)
@@ -531,6 +573,7 @@ async def create_season(inter: Interaction, name: str):
 
 @bot.tree.command(description="今週の参加告知を出す（管理者）")
 @commands.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 async def announce(inter: Interaction, week: int):
     async with SessionLocal() as db:
         season = await get_active_season(db)
@@ -651,30 +694,101 @@ class EntryView(ui.View):
                 await inter.response.send_message("参加登録が見つかりません。", ephemeral=True)
 
 
-@bot.tree.command(description="締切：先着順に8人ずつ部屋確定（管理者）")
+@bot.tree.command(description="締切：優先度→先着→レート順で部屋確定（管理者）")
 @commands.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 async def close_entries(inter: Interaction, week: int):
     async with SessionLocal() as db:
         season = await get_active_season(db)
         pending = await ensure_pending_session(db, season.id, week)
 
-        entries = await list_entries(db, pending.id)
-        confirmed_ids = [e.user_id for e in entries if e.status == "confirmed"]
+        rows = await db.execute(
+            select(
+                Entry.user_id,
+                Entry.created_at,
+                User.priority,
+                User.xp,
+                User.discord_user_id,
+                User.display_name,
+            )
+            .join(User, User.id == Entry.user_id)
+            .where(
+                Entry.session_id == pending.id,
+                Entry.status == "confirmed",
+            )
+        )
+        records = list(rows.all())
 
-        if len(confirmed_ids) < 8:
-            await inter.response.send_message("参加者が8人未満のため部屋確定できません。", ephemeral=True)
+        # === 8人未満の場合（SESSION_MEMBER_NUMを使用） ===
+        if len(records) < SESSION_MEMBER_NUM:
+            # セッションをキャンセル扱いに変更
+            await db.execute(
+                update(GameSession)
+                .where(GameSession.id == pending.id)
+                .values(status="canceled", room_label="CANCELED")
+            )
+
+            # priorityを+1
+            for (uid, _ts, prio, _xp, discord_uid, disp) in records:
+                await db.execute(
+                    update(User).where(User.id == uid).values(priority=prio + 1)
+                )
+            await db.commit()
+
+            mentions = ", ".join(
+                f"{disp}(<@{discord_uid}>)" for (_uid, _ts, _prio, _xp, discord_uid, disp) in records
+            )
+
+            msg = (
+                f"Week {week} の参加希望者が{SESSION_MEMBER_NUM}人未満だったため、"
+                f"セッションを **キャンセル** しました。\n"
+                f"以下のメンバーの **優先度を +1** しました: {mentions}"
+                if records else
+                f"Week {week} の参加希望者が{SESSION_MEMBER_NUM}人未満だったため、"
+                f"セッションを **キャンセル** しました。"
+            )
+            await inter.response.send_message(msg, ephemeral=False)
             return
 
-        chunks = [confirmed_ids[i:i+8] for i in range(0, len(confirmed_ids), 8)]
+        # === 優先度順・先着順・レート順での選抜 ===
+        records.sort(key=lambda r: (-r.priority, r.created_at))
+        num_take = (len(records) // SESSION_MEMBER_NUM) * SESSION_MEMBER_NUM
+        selected = records[:num_take]
+        dropped = records[num_take:]
+
+        # 落選者 priority +1
+        dropped_mentions = []
+        for (uid, _ts, prio, _xp, discord_uid, disp) in dropped:
+            await db.execute(
+                update(User).where(User.id == uid).values(priority=prio + 1)
+            )
+            dropped_mentions.append(f"{disp}(<@{discord_uid}>)")
+        if dropped:
+            await db.commit()
+
+        # 選抜者 priority = 0 にリセット
+        if selected:
+            await db.execute(
+                update(User)
+                .where(User.id.in_([r.user_id for r in selected]))
+                .values(priority=0)
+            )
+            await db.commit()
+
+        # レート降順で並べ替え
+        selected.sort(key=lambda r: (-r.xp, r.created_at))
+        selected_ids = [r.user_id for r in selected]
+
+        # SESSION_MEMBER_NUM単位で分割
+        chunks = [selected_ids[i:i+SESSION_MEMBER_NUM] for i in range(0, len(selected_ids), SESSION_MEMBER_NUM)]
         summary_msgs = []
 
         for idx, chunk in enumerate(chunks):
-            if len(chunk) < 8:
+            if len(chunk) < SESSION_MEMBER_NUM:
                 break
 
             room = ROOM_LABELS[idx]
 
-            # セッション作成
             sess = GameSession(
                 season_id=season.id,
                 week_number=week,
@@ -685,27 +799,19 @@ async def close_entries(inter: Interaction, week: int):
             db.add(sess)
             await db.commit(); await db.refresh(sess)
 
-            # entries作成
             for uid in chunk:
                 db.add(Entry(session_id=sess.id, user_id=uid, status="confirmed"))
             await db.commit()
 
-            # 当日勝数初期化
             await init_session_stats(db, sess.id, chunk)
-
-            # セッション開始
             start_msg = await _start_session(db, sess.id)
-
-            # 第1試合チーム自動生成
             next_msg = await _create_next_match_and_message(db, sess.id)
 
-            # メンション文作成
             mentions = " ".join([
-                f"<@{(await db.scalar(select(User).where(User.id == uid))).discord_user_id}>"
+                f"<@{(await db.scalar(select(User.discord_user_id).where(User.id == uid)))}>"
                 for uid in chunk
             ])
 
-            # 投稿メッセージ構築
             msg = (
                 f"**Week {week} 部屋 {room} — Session {sess.id}**\n"
                 f"{start_msg}\n\n"
@@ -713,11 +819,25 @@ async def close_entries(inter: Interaction, week: int):
                 f"{next_msg}"
             )
 
-            # 各部屋チャンネルへ投稿
             await _post_to_room_channel(inter, room, msg)
             summary_msgs.append(f"部屋 {room} を開始し、チームを発表しました。")
 
-        await inter.response.send_message("\n".join(summary_msgs), ephemeral=False)
+        if not inter.response.is_done():
+            await inter.response.send_message("\n".join(summary_msgs), ephemeral=False)
+        else:
+            await inter.followup.send("\n".join(summary_msgs), ephemeral=False)
+
+        if dropped_mentions:
+            try:
+                await inter.followup.send(
+                    f"{SESSION_MEMBER_NUM}人に満たず見送りとなったメンバー（priority +1 済み）: "
+                    + ", ".join(dropped_mentions),
+                    ephemeral=False
+                )
+            except Exception:
+                pass
+            
+
 
 @bot.tree.command(description="直近未確定の試合に勝敗を記録")
 async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
@@ -732,6 +852,13 @@ async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
         if not sess:
             await inter.response.send_message("セッションが見つかりません。", ephemeral=True)
             return
+        if sess.room_label in ("PENDING", "CANCELED") or sess.status in ("scheduled", "canceled"):
+            await inter.response.send_message(
+                f"Session {session_id} はまだ部屋確定前か、キャンセル済みのため勝敗を登録できません。",
+                ephemeral=True
+            )
+            return
+
         if sess.status == "finished":
             await inter.response.send_message(
                 f"Session {session_id} は既に終了済みです。", ephemeral=True
@@ -747,9 +874,16 @@ async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
             .order_by(Match.match_index.asc())
         )
         if not m:
-            # 未確定が無ければ次試合を作って部屋チャンネルへ発表
+            # PENDINGやCANCELEDでは新しい試合は作らない
+            if sess.room_label in ("PENDING", "CANCELED") or sess.status != "live":
+                await inter.response.send_message(
+                    f"Session {session_id} では新しい試合を作成できません。部屋確定後のセッションIDを指定してください。",
+                    ephemeral=True
+                )
+                return
+
             msg = await _create_next_match_and_message(db, session_id)
-            await _post_to_room_channel(inter, room, msg)
+            await _post_to_room_channel(inter, sess.room_label, msg)
             await inter.response.send_message("次試合を部屋チャンネルに投稿しました。", ephemeral=True)
             return
 
@@ -803,16 +937,18 @@ class UndoModal(ui.Modal, title="最新試合の結果を修正"):
         self.match_id = match_id
         self.room_label = room_label
 
+        # 勝者
         self.winner_input = ui.TextInput(
-            label="勝利チーム（A または B）",
+            label=f"勝利チーム（A または B）: 現在={current_winner or '未設定'}",
             placeholder="A または B",
             default=current_winner or "",
             required=True,
             max_length=1,
         )
+        # ステージ
         self.stage_input = ui.TextInput(
-            label="ステージ名",
-            placeholder="例）Museum d'Alfonsino",
+            label=f"ステージ名: 現在={current_stage or '未設定'}",
+            placeholder="例) Museum d'Alfonsino",
             default=current_stage or "",
             required=False,
             max_length=64,
@@ -822,7 +958,6 @@ class UndoModal(ui.Modal, title="最新試合の結果を修正"):
 
     async def on_submit(self, inter: Interaction):
         async with SessionLocal() as db:
-            # 1) 対象試合の取得と結果修正（wins差分も反映）
             m = await db.get(Match, self.match_id)
             if not m:
                 await inter.response.send_message("対象の試合が見つかりませんでした。", ephemeral=True)
@@ -830,15 +965,16 @@ class UndoModal(ui.Modal, title="最新試合の結果を修正"):
 
             msg_edit = await _apply_match_edit(db, m, self.winner_input.value, self.stage_input.value)
 
-            # 2) 10勝到達チェック
+            # 10勝到達チェック（修正後の状態で判定）
             ten = await db.scalar(
                 select(SessionStat).where(
-                    and_(SessionStat.session_id == self.session_id, SessionStat.wins >= 10)
+                    and_(SessionStat.session_id == self.session_id,
+                         SessionStat.wins >= 10)
                 )
             )
 
             if ten:
-                # (a) 10勝 → 自動終了
+                # 10勝 → 冪等finish（内部で「巻き戻し→再精算」）
                 finish_msg = await _finish_session(db, self.session_id)
                 room_msg = (
                     f"📢 **結果修正通知**\n"
@@ -855,7 +991,10 @@ class UndoModal(ui.Modal, title="最新試合の結果を修正"):
                 )
                 return
 
-            # (b) 未到達 → 未確定Matchを“最新の1件だけ”掃除してから次試合を生成
+            # ▼▼ ここで呼ぶ：10勝未到達 → もし既に finished 済みなら「巻き戻して live に戻す」 ▼▼
+            await _reopen_session_if_finished(db, self.session_id)
+
+            # “最新の未確定1件だけ”掃除
             pending = await db.scalar(
                 select(Match)
                 .where(and_(Match.session_id == self.session_id, Match.winner == None))
@@ -865,10 +1004,10 @@ class UndoModal(ui.Modal, title="最新試合の結果を修正"):
                 await db.delete(pending)
                 await db.commit()
 
-            # 次試合のチーム編成とレコード生成
+            # 次試合生成
             next_msg = await _create_next_match_and_message(db, self.session_id)
 
-            # 部屋チャンネルへ告知（この上は従来どおり）
+            # 部屋告知
             room_msg = (
                 f"📢 **結果修正通知**\n"
                 f"Session {self.session_id} / Match #{m.match_index}\n"
@@ -880,44 +1019,50 @@ class UndoModal(ui.Modal, title="最新試合の結果を修正"):
             await _post_to_room_channel(inter, self.room_label, room_msg)
 
             await inter.response.send_message(
-                f"{msg_edit}\n次試合を部屋チャンネルへ投稿しました。",
+                f"{msg_edit}\n最新の未確定1件を掃除し、次試合を部屋チャンネルへ投稿しました。",
                 ephemeral=True
             )
 
 @bot.tree.command(description="最新の試合結果を修正")
 async def undo(inter: Interaction, session_id: int):
     async with SessionLocal() as db:
-        # 最新試合を取得
-        latest = await db.scalar(
+        # 1) winner が入っている中で一番新しい試合を取る
+        latest_confirmed = await db.scalar(
             select(Match)
-            .where(Match.session_id == session_id)
+            .where(
+                Match.session_id == session_id,
+                Match.winner.is_not(None)
+            )
             .order_by(desc(Match.match_index))
         )
-        if not latest:
+
+        # なければ一応一番新しい試合を取る（初回保険）
+        if latest_confirmed:
+            target_match = latest_confirmed
+        else:
+            target_match = await db.scalar(
+                select(Match)
+                .where(Match.session_id == session_id)
+                .order_by(desc(Match.match_index))
+            )
+
+        if not target_match:
             await inter.response.send_message("このセッションには試合がありません。", ephemeral=True)
             return
 
-        # セッション情報を取得して room_label を取得
+        # room_label 取得
         sess = await db.get(GameSession, session_id)
         room_label = sess.room_label if sess else "?"
 
-        # 現在の結果を表示
-        info = (
-            f"セッション {session_id} の最新試合は **#{latest.match_index}** です。\n"
-            f"勝者: {latest.winner or '未設定'} / ステージ: {latest.stage or ''}\n\n"
-            f"この内容を修正します。新しい値を入力してください。"
-        )
-        await inter.response.send_message(info, ephemeral=True)
-
-        # モーダルを開く
+        # ここで “最初の応答” としてモーダルを表示する
         modal = UndoModal(
             session_id=session_id,
-            match_id=latest.id,
+            match_id=target_match.id,
             room_label=room_label,
-            current_winner=latest.winner,
-            current_stage=latest.stage or "",
+            current_winner=target_match.winner,
+            current_stage=target_match.stage or "",
         )
-        await inter.followup.send_modal(modal)
+        await inter.response.send_modal(modal)
 
 # -------------------------
 # 任意の試合番号の結果を修正：/modify
@@ -931,15 +1076,16 @@ class ModifyModal(ui.Modal, title="指定試合の結果を修正"):
         self.match_id = match_id
         self.match_index = match_index
 
+        # ここで「今こうなってますよ」をラベルに含めておく
         self.winner_input = ui.TextInput(
-            label="勝利チーム（A または B）",
+            label=f"勝利チーム（A/B） 現在={current_winner or '未設定'}",
             placeholder="A または B",
             default=current_winner or "",
             required=True,
             max_length=1
         )
         self.stage_input = ui.TextInput(
-            label="ステージ名",
+            label=f"ステージ名 現在={current_stage or '未設定'}",
             placeholder="例）Museum d'Alfonsino",
             default=current_stage or "",
             required=False,
@@ -962,7 +1108,7 @@ class ModifyModal(ui.Modal, title="指定試合の結果を修正"):
 
 
 @bot.tree.command(description="指定した試合番号の結果を修正（管理者）")
-@commands.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 async def modify(inter: Interaction, session_id: int, match_index: int):
     async with SessionLocal() as db:
         m = await db.scalar(
@@ -973,40 +1119,49 @@ async def modify(inter: Interaction, session_id: int, match_index: int):
             await inter.response.send_message("指定の試合が見つかりません。", ephemeral=True)
             return
 
-        # 現状を表示
-        info = (f"セッション {session_id} / 試合 **#{match_index}** の現在の結果:\n"
-                f"勝者: {m.winner or '未設定'} / ステージ: {m.stage or ''}\n\n"
-                f"この内容を修正します。新しい値を入力してください。")
-        await inter.response.send_message(info, ephemeral=True)
-
-        # モーダルを開いて入力を受け付ける
-        modal = ModifyModal(session_id=session_id,
-                            match_id=m.id,
-                            match_index=match_index,
-                            current_winner=m.winner,
-                            current_stage=m.stage or "")
-        await inter.followup.send_modal(modal)
+        # ここで “最初の応答” としてモーダルを出す
+        modal = ModifyModal(
+            session_id=session_id,
+            match_id=m.id,
+            match_index=match_index,
+            current_winner=m.winner,
+            current_stage=m.stage or "",
+        )
+        await inter.response.send_modal(modal)
 
 @bot.tree.command(description="リーダーボードを表示")
+@commands.has_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
 async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
     async with SessionLocal() as db:
+        # シーズン取得
         if season_name:
-            season = await db.scalar(select(Season).where(Season.name==season_name))
+            season = await db.scalar(select(Season).where(Season.name == season_name))
         else:
             season = await get_active_season(db)
+
         if not season:
             await inter.response.send_message("シーズンが見つかりません。", ephemeral=True)
             return
-        rows = (await db.execute(select(SeasonScore, User).join(User, User.id==SeasonScore.user_id)
-                .where(SeasonScore.season_id==season.id)
-                .order_by(desc(SeasonScore.entry_points + SeasonScore.win_points)))).all()
+
+        # ★ レート降順で上位10件だけ
+        result = await db.execute(
+            select(SeasonScore, User)
+            .join(User, User.id == SeasonScore.user_id)
+            .where(SeasonScore.season_id == season.id)
+            .order_by(desc(SeasonScore.rate))
+            .limit(10)
+        )
+        rows = result.all()
+
         if not rows:
             await inter.response.send_message("まだスコアがありません。", ephemeral=True)
             return
-        lines = [f"**{season.name} Leaderboard**"]
-        for i,(sc,u) in enumerate(rows, start=1):
-            total = sc.entry_points + sc.win_points
-            lines.append(f"{i}. {u.display_name} — {total:.1f}pt (参加{sc.entry_points:.1f} + 勝利{sc.win_points})")
+
+        lines = [f"**{season.name} Leaderboard (Top 10 / by Rate)**"]
+        for i, (sc, u) in enumerate(rows, start=1):
+            lines.append(f"{i}. {u.display_name} — {sc.rate:.1f}")
+
         await inter.response.send_message("\n".join(lines), ephemeral=False)
 
 

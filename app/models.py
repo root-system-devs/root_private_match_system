@@ -14,6 +14,7 @@ class User(Base):
     discord_user_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
     display_name: Mapped[str] = mapped_column(String(64))
     xp: Mapped[float] = mapped_column(Float, default=2000.0)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -55,6 +56,15 @@ class SessionStat(Base):
     session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
     wins: Mapped[int] = mapped_column(Integer, default=0)
+    
+class SessionSettlement(Base):
+    __tablename__ = "session_settlements"
+    season_id:  Mapped[int]   = mapped_column(ForeignKey("seasons.id"),  primary_key=True)
+    session_id: Mapped[int]   = mapped_column(ForeignKey("sessions.id"), primary_key=True)
+    user_id:    Mapped[int]   = mapped_column(ForeignKey("users.id"),    primary_key=True)
+    win_delta:  Mapped[int]   = mapped_column(Integer, default=0)   # そのセッションで加算した勝数（=通常 st.wins）
+    rate_delta: Mapped[float] = mapped_column(Float,   default=0.0) # そのセッションで変更したレート量（Δ）
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class SeasonScore(Base):
