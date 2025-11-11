@@ -34,6 +34,16 @@ async def on_ready():
     bot.add_view(RegisterView())
     print(f"Logged in as {bot.user}")
 
+def compute_initial_rate_from_xp(xp: float) -> float:
+    """
+    xp から初期レートを作る。（暫定版）
+    """
+    base = xp - 1000
+    if base <= 2500:
+        return base
+    if base <= 0:
+        return 1000.0
+    return 2500.0
 
 # Discord上のユーザーがDBにいない場合、自動的に登録
 async def ensure_user(db, member: discord.abc.User):
@@ -448,10 +458,14 @@ class XpModal(ui.Modal, title="XPを入力"):
                 )
                 created_score = False
                 if not score:
-                    # まだなければ“初期値”として rate を設定
+                    initial_rate = compute_initial_rate_from_xp(init_rate)
+
                     score = SeasonScore(
-                        season_id=season.id, user_id=user.id,
-                        entry_points=0.0, win_points=0, rate=init_rate
+                        season_id=season.id,
+                        user_id=user.id,
+                        entry_points=0.0,
+                        win_points=0,
+                        rate=initial_rate,
                     )
                     db.add(score)
                     created_score = True
@@ -491,7 +505,7 @@ class XpModal(ui.Modal, title="XPを入力"):
                 try:
                     await member.add_roles(role, reason="League registration with initial rate")
                     if created_score:
-                        msg_tail = f"SeasonScore.rate を {init_rate} で初期化し、ロール「{role_name}」を付与しました。"
+                        msg_tail = f"初期レートは {initial_rate} です。ロール「{role_name}」を付与しました。"
                     else:
                         # 既にSeasonScoreがある場合は“初期値”のため上書きしない
                         msg_tail = f"既にシーズン{season.name}のスコアがあるため rate は変更していません。ロール「{role_name}」を付与しました。"
