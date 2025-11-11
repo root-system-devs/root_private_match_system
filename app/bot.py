@@ -45,6 +45,11 @@ def compute_initial_rate_from_xp(xp: float) -> float:
         return 1000.0
     return 2500.0
 
+def calc_delta_rate(user_rate: float, wins: int, avg_rate: float, max_wins: int, k: float) -> float:
+                perf = (wins / max_wins) - 0.5
+                diff_term = (avg_rate - user_rate) / 400.0
+                return k * (perf + diff_term)
+
 # Discord上のユーザーがDBにいない場合、自動的に登録
 async def ensure_user(db, member: discord.abc.User):
     uid = str(member.id)
@@ -319,12 +324,7 @@ async def _finish_session(db, session_id: int) -> str:
     avg_rate = sum(rates)/len(rates) if rates else 1000.0
     max_wins = max(int(s.wins) for s in stats) if stats else 1
 
-    # 暫定レート式
-    K = 20.0
-    def calc_delta_rate(user_rate: float, wins: int, avg_rate: float, max_wins: int) -> float:
-        perf = (wins / max_wins) - 0.5
-        diff_term = (avg_rate - user_rate) / 400.0
-        return K * (perf + diff_term)
+    k = 20.0
 
     # --- ③ 最新の結果で再精算し、履歴を記録 ---
     for st in stats:
@@ -332,7 +332,7 @@ async def _finish_session(db, session_id: int) -> str:
         sc  = score_map[uid]
 
         win_delta  = int(st.wins)                     # 今セッションでの勝数加算
-        rate_delta = float(calc_delta_rate(sc.rate, int(st.wins), avg_rate, max_wins))
+        rate_delta = float(calc_delta_rate(sc.rate, int(st.wins), avg_rate, max_wins, k))
 
         sc.win_points += win_delta
         sc.rate       += rate_delta
@@ -347,7 +347,7 @@ async def _finish_session(db, session_id: int) -> str:
     await db.commit()
 
     return (f"Session {session_id} を終了し、当日の勝数・レートを精算しました。"
-            f"（平均レート: {avg_rate:.1f}, K={K:g}）")
+            f"（平均レート: {avg_rate:.1f}, K={k:g}）")
 
 async def _reopen_session_if_finished(db, session_id: int):
     sess = await db.get(GameSession, session_id)
@@ -1142,6 +1142,188 @@ async def modify(inter: Interaction, session_id: int, match_index: int):
             current_stage=m.stage or "",
         )
         await inter.response.send_modal(modal)
+
+@bot.tree.command(description="【危険】指定シーズンのレートをMatchから再計算（管理者専用）")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def recalc_season_rates(inter: Interaction, season_name: Optional[str] = None):
+    """
+    想定シナリオ:
+      - modify で Match を書き換えた
+      - SessionSettlement はもう信用できない
+      - なので Match だけを信じて「そのシーズンを最初から」レート/勝数を積み直す
+    """
+    async with SessionLocal() as db:
+        # 1. 対象シーズンの特定
+        if season_name:
+            season = await db.scalar(select(Season).where(Season.name == season_name))
+        else:
+            season = await get_active_season(db)
+        if not season:
+            await inter.response.send_message("シーズンが見つかりません。", ephemeral=True)
+            return
+
+        # 2. そのシーズンの参加者とユーザー情報を取る
+        part_rows = await db.execute(
+            select(SeasonParticipant, User)
+            .join(User, User.id == SeasonParticipant.user_id)
+            .where(SeasonParticipant.season_id == season.id)
+        )
+        participants = part_rows.all()  # [(SeasonParticipant, User), ...]
+
+        if not participants:
+            await inter.response.send_message("このシーズンには参加者がいません。", ephemeral=True)
+            return
+
+        # 3. 旧 SessionSettlement をすべて削除（このシーズン分だけ）
+        await db.execute(
+            delete(SessionSettlement).where(SessionSettlement.season_id == season.id)
+        )
+        await db.commit()
+
+        # 4. SeasonScore を初期化（rateとwin_pointsだけ）
+        #    entry_pointsはそのまま残す（大会参加回数などを壊さないため）
+        current_rates: dict[int, float] = {}
+        for _sp, u in participants:
+            init_rate = compute_initial_rate_from_xp(u.xp)
+            current_rates[u.id] = init_rate
+
+            sc = await db.scalar(
+                select(SeasonScore)
+                .where(and_(SeasonScore.season_id == season.id, SeasonScore.user_id == u.id))
+            )
+            if sc:
+                # 参加ポイントは保持、勝利ポイントとレートはリセット
+                sc.rate = init_rate
+                sc.win_points = 0
+            else:
+                # SeasonScoreがなかった人は新規に作る
+                sc = SeasonScore(
+                    season_id=season.id,
+                    user_id=u.id,
+                    entry_points=0.0,
+                    win_points=0,
+                    rate=init_rate,
+                )
+                db.add(sc)
+        await db.commit()
+
+        # 5. シーズン内のセッションを古い順に回す
+        sess_rows = await db.execute(
+            select(GameSession)
+            .where(GameSession.season_id == season.id)
+            .order_by(GameSession.scheduled_at, GameSession.id)
+        )
+        sessions = sess_rows.scalars().all()
+
+        # CSVパーサ
+        def _parse_ids(csv: str) -> list[int]:
+            return [int(x) for x in csv.split(",") if x.strip()]
+
+        for sess in sessions:
+            # このセッションに参加している人
+            entry_rows = await db.execute(
+                select(Entry.user_id)
+                .where(and_(Entry.session_id == sess.id, Entry.status == "confirmed"))
+            )
+            session_user_ids = [r[0] for r in entry_rows.all()]
+
+            if not session_user_ids:
+                # 誰もいないセッションはスキップ（PENDINGとかCANCELEDの名残り）
+                continue
+
+            # このセッションのMatchを試合順に取得
+            match_rows = await db.execute(
+                select(Match)
+                .where(Match.session_id == sess.id)
+                .order_by(Match.match_index)
+            )
+            matches = match_rows.scalars().all()
+
+            # 6. Matchからこのセッションの「勝数」を組み立てる
+            #    user_id -> wins_in_this_session
+            session_wins: dict[int, int] = {uid: 0 for uid in session_user_ids}
+
+            for m in matches:
+                if not m.winner:
+                    # winnerが入っていない試合は無視（まだ未確定）
+                    continue
+                team_a = _parse_ids(m.team_a_ids)
+                team_b = _parse_ids(m.team_b_ids)
+                if m.winner.upper() == "A":
+                    winners = team_a
+                else:
+                    winners = team_b
+                for uid in winners:
+                    # セッション参加者に限って加算（保険）
+                    if uid in session_wins:
+                        session_wins[uid] += 1
+
+            # 7. _finish_session と同じレート式を適用するための値を作る
+            #   rates は「この時点の」各参加者のレート
+            rates_for_this_session = [current_rates[uid] for uid in session_user_ids]
+            avg_rate = sum(rates_for_this_session) / len(rates_for_this_session) if rates_for_this_session else 1000.0
+            max_wins = max(session_wins.values()) if session_wins else 1
+            if max_wins <= 0:
+                max_wins = 1
+
+            k = 20.0
+
+
+            # 8. SessionStat をこの値で上書き（既存があれば消す/上書きする）
+            #    まずこのセッションの古い SessionStat を消す
+            await db.execute(
+                delete(SessionStat).where(SessionStat.session_id == sess.id)
+            )
+            await db.commit()
+
+            # 9. 各参加者に対してレートを更新＆SessionStatを作成＆SessionSettlementを作成
+            for uid in session_user_ids:
+                before_rate = current_rates.get(uid, 0.0)
+                wins = session_wins.get(uid, 0)
+                delta = calc_delta_rate(before_rate, wins, avg_rate, max_wins, k)
+                after_rate = before_rate + delta
+
+                # 現在レートを更新
+                current_rates[uid] = after_rate
+
+                # SeasonScore も更新（rate と win_points）
+                sc = await db.scalar(
+                    select(SeasonScore)
+                    .where(and_(SeasonScore.season_id == season.id, SeasonScore.user_id == uid))
+                )
+                if sc:
+                    sc.rate = after_rate
+                    sc.win_points = (sc.win_points or 0) + wins
+
+                # SessionStat を追加
+                st = SessionStat(
+                    session_id=sess.id,
+                    user_id=uid,
+                    wins=wins,
+                )
+                db.add(st)
+
+                # SessionSettlement を追加（このセッションでどれだけ増えたか）
+                ss = SessionSettlement(
+                    season_id=season.id,
+                    session_id=sess.id,
+                    user_id=uid,
+                    win_delta=wins,
+                    rate_delta=delta,
+                    calculated_at=datetime.now(timezone.utc),
+                )
+                db.add(ss)
+
+            # このセッションを finished にしておくとわかりやすい
+            sess.status = "finished"
+            await db.commit()
+
+        # 10. 完了通知
+        await inter.response.send_message(
+            f"シーズン「{season.name}」のレートと勝数を Match から再計算しました。\n"
+            f"※modify実行後の整合性取りに使うことを想定しています。",
+            ephemeral=True
+        )
 
 @bot.tree.command(description="リーダーボードを表示")
 @commands.has_permissions(manage_guild=True)
