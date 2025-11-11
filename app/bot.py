@@ -908,6 +908,212 @@ async def close_entries(inter: Interaction, week: int):
             )
             
 
+@bot.tree.command(description="ドタキャンが出たセッションを再募集モードにする（管理者）")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def reopen_session(inter: Interaction, session_id: int, dropout_discord_ids: str):
+    """
+    dropout_discord_ids: カンマ or スペース区切りで複数指定想定
+      例: "1234567890, 222222222222" みたいに
+    """
+    async with SessionLocal() as db:
+        sess = await db.get(GameSession, session_id)
+        if not sess:
+            await inter.response.send_message("指定されたセッションが見つかりません。", ephemeral=True)
+            return
+
+        # このセッションは「まだ試合開始前に戻す」ものなので scheduled に戻しておく
+        sess.status = "scheduled"
+
+        # 既存で自動生成されていた試合は一旦全部消しておく
+        await db.execute(delete(Match).where(Match.session_id == session_id))
+
+        # ドタキャンのDiscord IDをパース
+        raw_ids = [x.strip() for x in dropout_discord_ids.replace(",", " ").split() if x.strip()]
+        removed_mentions = []
+        for disc_id in raw_ids:
+            # DBにいるユーザを探す
+            u = await db.scalar(select(User).where(User.discord_user_id == disc_id))
+            if not u:
+                continue
+
+            # entries から落とす
+            ent = await db.scalar(
+                select(Entry).where(and_(Entry.session_id == session_id, Entry.user_id == u.id))
+            )
+            if ent:
+                await db.delete(ent)
+
+            # その人の session_stats も一応消しておく（init済みだった場合）
+            await db.execute(
+                delete(SessionStat).where(
+                    and_(SessionStat.session_id == session_id, SessionStat.user_id == u.id)
+                )
+            )
+
+            removed_mentions.append(f"{u.display_name}(<@{u.discord_user_id}>)")
+
+        await db.commit()
+
+    # 再募集用のボタンを表示
+    view = RefillSessionView(session_id=session_id)
+    msg = (
+        f"Session {session_id} でドタキャンがあったため再募集します。\n"
+        f"足りない人数が埋まるまでこのボタンで参加してください。\n"
+    )
+    if removed_mentions:
+        msg += "ドタキャン扱い: " + ", ".join(removed_mentions)
+
+    await inter.response.send_message(msg, view=view, ephemeral=False)
+    
+class RefillSessionView(ui.View):
+    def __init__(self, session_id: int):
+        super().__init__(timeout=None)
+        self.session_id = session_id
+
+    @ui.button(label="この部屋に参加する", style=discord.ButtonStyle.success)
+    async def join_session(self, inter: Interaction, button: ui.Button):
+        async with SessionLocal() as db:
+            sess = await db.get(GameSession, self.session_id)
+            if not sess or sess.status in ("canceled", "finished"):
+                await inter.response.send_message("このセッションには参加できません。", ephemeral=True)
+                return
+
+            season = await db.scalar(select(Season).where(Season.id == sess.season_id))
+            if not season:
+                await inter.response.send_message("シーズンが見つかりません。", ephemeral=True)
+                return
+
+            user = await ensure_user(db, inter.user)
+
+            # シーズン参加者チェック
+            is_participant = await db.scalar(
+                select(SeasonParticipant).where(
+                    and_(
+                        SeasonParticipant.season_id == season.id,
+                        SeasonParticipant.user_id == user.id,
+                    )
+                )
+            )
+            if not is_participant:
+                await inter.response.send_message(
+                    f"{inter.user.mention} さんはまだシーズン{season.name}の参加者ではありません。",
+                    ephemeral=True,
+                )
+                return
+
+            # いまの参加者(confirmed)を集める
+            current_rows = await db.execute(
+                select(Entry).where(
+                    and_(Entry.session_id == self.session_id)
+                )
+            )
+            entries = current_rows.scalars().all()
+            confirmed_ids = [e.user_id for e in entries if e.status == "confirmed"]
+
+            # このユーザのエントリがすでに存在するかどうかを見る
+            my_entry = next((e for e in entries if e.user_id == user.id), None)
+            if my_entry and my_entry.status == "confirmed":
+                # 本当に今も参加中なら弾く
+                await inter.response.send_message("このセッションにはすでに参加しています。", ephemeral=True)
+                return
+            elif my_entry and my_entry.status != "confirmed":
+                # 以前いたけどドタキャンなどでconfirmedじゃなくなっている → 復活させる
+                my_entry.status = "confirmed"
+                await db.commit()
+            else:
+                # 完全に初参加の場合
+                if len(confirmed_ids) >= SESSION_MEMBER_NUM:
+                    await inter.response.send_message("このセッションはすでに満員です。", ephemeral=True)
+                    return
+                db.add(Entry(session_id=self.session_id, user_id=user.id, status="confirmed"))
+                await db.commit()
+
+            # statsも念のため初期化（なかった人だけ）
+            await init_session_stats(db, self.session_id, [user.id])
+
+            # 最新の参加者数を数え直す
+            current_rows = await db.execute(
+                select(Entry.user_id).where(
+                    and_(Entry.session_id == self.session_id, Entry.status == "confirmed")
+                )
+            )
+            current_user_ids = [r[0] for r in current_rows.all()]
+
+            # まだ足りてなければその旨伝えて終わり
+            if len(current_user_ids) < SESSION_MEMBER_NUM:
+                await inter.response.send_message(
+                    f"参加を受け付けました。現在 {len(current_user_ids)}/{SESSION_MEMBER_NUM} 人です。",
+                    ephemeral=True,
+                )
+                return
+
+            # ここまで来たらちょうど満員
+            sess.status = "scheduled"
+            await db.commit()
+
+            start_msg = await _start_session(db, self.session_id)
+            next_msg = await _create_next_match_and_message(db, self.session_id)
+
+            mentions = " ".join([
+                f"<@{(await db.scalar(select(User.discord_user_id).where(User.id == uid)))}>"
+                for uid in current_user_ids
+            ])
+
+            msg = (
+                f"**Week {sess.week_number} 部屋 {sess.room_label} — Session {sess.id}（再募集完了）**\n"
+                f"{start_msg}\n\n"
+                f"参加者: {mentions}\n\n"
+                f"{next_msg}"
+            )
+            await _post_to_room_channel(inter, sess.room_label, msg)
+
+            await inter.response.send_message(
+                "参加を受け付けました。定員に達したためチームを発表しました。",
+                ephemeral=True,
+            )
+
+@bot.tree.command(description="再募集でも人が集まらなかったセッションをキャンセル（管理者）")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def cancel_reopen_session(inter: Interaction, session_id: int):
+    async with SessionLocal() as db:
+        sess = await db.get(GameSession, session_id)
+        if not sess:
+            await inter.response.send_message("指定されたセッションが見つかりません。", ephemeral=True)
+            return
+
+        # 現在残っている参加者を取得
+        rows = await db.execute(
+            select(Entry.user_id, User.priority, User.display_name, User.discord_user_id)
+            .join(User, User.id == Entry.user_id)
+            .where(
+                and_(Entry.session_id == session_id, Entry.status == "confirmed")
+            )
+        )
+        remains = rows.all()
+
+        # セッションをキャンセル扱いに
+        sess.status = "canceled"
+        sess.room_label = "CANCELED"
+        await db.commit()
+
+        # 残ってた人の priority を +1
+        for (uid, prio, disp, disc_id) in remains:
+            await db.execute(
+                update(User).where(User.id == uid).values(priority=prio + 1)
+            )
+        await db.commit()
+
+    # 公開で知らせる
+    if remains:
+        mentions = ", ".join(f"{disp}(<@{disc_id}>)" for (_uid, _prio, disp, disc_id) in remains)
+        msg = (
+            f"Session {session_id} は再募集でも人数が集まらなかったためキャンセルしました。\n"
+            f"以下のメンバーの優先度を+1しました: {mentions}"
+        )
+    else:
+        msg = f"Session {session_id} は再募集でも人数が集まらなかったためキャンセルしました。"
+
+    await inter.response.send_message(msg, ephemeral=False)
 
 @bot.tree.command(description="直近未確定の試合に勝敗を記録")
 async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
