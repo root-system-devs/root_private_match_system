@@ -1,10 +1,9 @@
 version: "3.9"
 
-
 services:
   db:
     image: postgres:16
-    environment:
+    environment:  # pgAdmin内で接続先サーバを作る際に使う情報
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: pass
       POSTGRES_DB: league
@@ -17,17 +16,28 @@ services:
       retries: 12
     restart: unless-stopped
 
-
   bot:
     build: .
     env_file: .env
     depends_on:
       db:
         condition: service_healthy
-    # ホットリロードが欲しいときだけ（ホストのファイルをコンテナに反映）
     volumes:
       - .:/app
     restart: unless-stopped
 
+  pgadmin:
+    image: dpage/pgadmin4
+    environment:  # pgAdminのログイン情報
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com   # 好きなアドレスでOK
+      PGADMIN_DEFAULT_PASSWORD: admin        # 好きなパスワードでOK
+    ports:
+      - "8080:80"     # ← http://localhost:8080 で開ける
+    depends_on:
+      - db
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin  # 設定を残したい場合（任意）
+
 volumes:
   pgdata:
+  pgadmin_data:
