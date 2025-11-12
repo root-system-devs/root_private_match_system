@@ -454,7 +454,7 @@ class XpModal(ui.Modal, title="XPを入力"):
             # 2) アクティブシーズンがあれば SeasonParticipant と SeasonScore を用意
             season = await get_active_season(db)
             if season:
-                # 参加者登録（冪等）
+                # 参加者登録
                 existed_participant = await db.scalar(
                     select(SeasonParticipant).where(
                         and_(SeasonParticipant.season_id == season.id,
@@ -562,6 +562,106 @@ async def register(inter: Interaction):
         f"登録ボタンを表示しました。",
         ephemeral=True
     )
+    
+class RateResetModal(ui.Modal, title="XPを入力（レートリセット）"):
+    def __init__(self, target_user_id: int, target_season_id: int, season_name: str):
+        super().__init__(timeout=180)
+        self.target_user_id = target_user_id
+        self.target_season_id = target_season_id
+        self.season_name = season_name
+
+        self.xp_input = ui.TextInput(
+            label="新しいXP",
+            placeholder="例）2000",
+            required=True,
+            max_length=12,
+        )
+        self.add_item(self.xp_input)
+
+    async def on_submit(self, inter: Interaction):
+        # 数値パース
+        try:
+            xp_val = float(str(self.xp_input.value).strip())
+        except ValueError:
+            await inter.response.send_message("数値を入力してください。", ephemeral=True)
+            return
+
+        async with SessionLocal() as db:
+            user = await db.get(User, self.target_user_id)
+            season = await db.get(Season, self.target_season_id)
+            if not user or not season:
+                await inter.response.send_message("対象ユーザーまたはシーズンが見つかりませんでした。", ephemeral=True)
+                return
+
+            # ここで「そのシーズンの参加者かどうか」を SeasonScore で判定
+            score = await db.scalar(
+                select(SeasonScore).where(
+                    and_(
+                        SeasonScore.season_id == season.id,
+                        SeasonScore.user_id == user.id,
+                    )
+                )
+            )
+
+            # 参加者なのでXPとレートを更新
+            user.xp = xp_val
+            initial_rate = compute_initial_rate_from_xp(xp_val)
+            score.rate = initial_rate
+            await db.commit()
+
+        await inter.response.send_message(
+            f"{user.display_name} さんのXPを **{xp_val}** に更新し、"
+            f"シーズン{self.season_name}でのレートを **{initial_rate}** にリセットしました。",
+            ephemeral=True,
+        )
+
+@bot.tree.command(description="指定ユーザーのXPを入力し、レートをリセット（管理者）")
+@app_commands.checks.has_permissions(manage_guild=True)
+async def reset_rate(inter: Interaction, season_name: str, discord_id: str):
+    # メンション形式でも数値でもOKにする
+    raw = discord_id.strip()
+    if raw.startswith("<@") and raw.endswith(">"):
+        raw = raw[2:-1]
+        if raw.startswith("!"):
+            raw = raw[1:]
+
+    async with SessionLocal() as db:
+        # 1) シーズン取得
+        season = await db.scalar(select(Season).where(Season.name == season_name))
+        if not season:
+            await inter.response.send_message("指定されたシーズンが見つかりません。", ephemeral=True)
+            return
+
+        # 2) ユーザー取得（discord_user_idベース）
+        user = await db.scalar(select(User).where(User.discord_user_id == raw))
+        if not user:
+            await inter.response.send_message("指定されたDiscord IDのユーザーが見つかりません。", ephemeral=True)
+            return
+
+        # 3) そのシーズンの参加者かどうかを SeasonScore で確認
+        score = await db.scalar(
+            select(SeasonScore).where(
+                and_(
+                    SeasonScore.season_id == season.id,
+                    SeasonScore.user_id == user.id,
+                )
+            )
+        )
+        if not score:
+            await inter.response.send_message(
+                f"{user.display_name} さんはシーズン「{season.name}」の参加者ではありません。",
+                ephemeral=True,
+            )
+            return
+
+    # 参加していることが分かったのでモーダルを出す
+    modal = RateResetModal(
+        target_user_id=user.id,
+        target_season_id=season.id,
+        season_name=season.name,
+    )
+    await inter.response.send_modal(modal)
+    
 
 @bot.tree.command(description="アクティブシーズンを作成（管理者）")
 @commands.has_permissions(manage_guild=True)
