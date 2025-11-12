@@ -29,8 +29,8 @@ services:
   pgadmin:
     image: dpage/pgadmin4
     environment:  # pgAdminのログイン情報
-      PGADMIN_DEFAULT_EMAIL: admin@admin.com   # 好きなアドレスでOK
-      PGADMIN_DEFAULT_PASSWORD: admin        # 好きなパスワードでOK
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
     ports:
       - "8080:80"     # ← http://localhost:8080 で開ける
     depends_on:
