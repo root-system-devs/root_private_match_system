@@ -88,12 +88,19 @@ class SessionSettlement(Base):
     calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+
 class SeasonScore(Base):
     __tablename__ = "season_scores"
+
     season_id: Mapped[int] = mapped_column(ForeignKey("seasons.id"), primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
-    entry_points: Mapped[float] = mapped_column(default=0.0)
-    win_points: Mapped[int] = mapped_column(default=0)
+    # セッション参加数
+    entry_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 勝利数
+    win_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 対戦数
+    match_count: Mapped[int] = mapped_column(Integer, default=0)
+
     rate: Mapped[float] = mapped_column(Float, default=2000.0)
 
 
