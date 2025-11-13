@@ -588,7 +588,7 @@ class XpModal(ui.Modal, title="XPを入力"):
 
 # ========== コマンド ==========
 @bot.tree.command(description="リーグに登録（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def register(inter: Interaction):
     # メッセージに「登録」ボタンを表示
     await inter.channel.send(
@@ -661,7 +661,7 @@ class RateResetModal(ui.Modal, title="XPを入力（レートリセット）"):
 
 
 @bot.tree.command(description="指定ユーザーのXPを入力し、レートをリセット（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def reset_rate(inter: Interaction, season_name: str, discord_id: str):
     # メンション形式でも数値でもOKにする
     raw = discord_id.strip()
@@ -709,7 +709,7 @@ async def reset_rate(inter: Interaction, season_name: str, discord_id: str):
 
 
 @bot.tree.command(description="アクティブシーズンを作成（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def create_season(inter: Interaction, name: str):
     async with SessionLocal() as db:
         now = datetime.now(timezone.utc)
@@ -746,7 +746,7 @@ async def create_season(inter: Interaction, name: str):
 
 
 @bot.tree.command(description="今週の参加告知を出す（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def announce(inter: Interaction, week: int):
     async with SessionLocal() as db:
         season = await get_active_season(db)
@@ -914,7 +914,7 @@ class EntryView(ui.View):
 
 
 @bot.tree.command(description="締切：優先度→先着→レート順で部屋確定（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def close_entries(inter: Interaction, week: int):
     async with SessionLocal() as db:
         season = await get_active_season(db)
@@ -1059,7 +1059,7 @@ async def close_entries(inter: Interaction, week: int):
             )
 
 @bot.tree.command(description="ドタキャンが出たセッションを再募集モードにする（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def reopen_session(inter: Interaction, session_id: int, dropout_discord_ids: str):
     """
     dropout_discord_ids: カンマ or スペース区切りで複数指定想定
@@ -1226,7 +1226,7 @@ class RefillSessionView(ui.View):
 
 
 @bot.tree.command(description="再募集でも人が集まらなかったセッションをキャンセル（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def cancel_reopen_session(inter: Interaction, session_id: int):
     async with SessionLocal() as db:
         sess = await db.get(GameSession, session_id)
@@ -1649,7 +1649,7 @@ class ModifyModal(ui.Modal, title="指定試合の結果を修正"):
 
 
 @bot.tree.command(description="指定した試合番号の結果を修正（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def modify(inter: Interaction, session_id: int, match_index: int):
     async with SessionLocal() as db:
         m = await db.scalar(
@@ -1672,7 +1672,7 @@ async def modify(inter: Interaction, session_id: int, match_index: int):
             
 
 @bot.tree.command(description="指定シーズンのレートをMatchから再計算（管理者）")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def recalc_season_rates(inter: Interaction, season_name: Optional[str] = None):
     """
     想定シナリオ:
@@ -1862,7 +1862,7 @@ async def recalc_season_rates(inter: Interaction, season_name: Optional[str] = N
 
 
 @bot.tree.command(description="リーダーボードを表示")
-@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.default_permissions(manage_guild=True)
 async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
     async with SessionLocal() as db:
         # シーズン取得
