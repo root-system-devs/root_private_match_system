@@ -588,7 +588,6 @@ class XpModal(ui.Modal, title="XPを入力"):
 
 # ========== コマンド ==========
 @bot.tree.command(description="リーグに登録（管理者）")
-@commands.has_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def register(inter: Interaction):
     # メッセージに「登録」ボタンを表示
@@ -710,7 +709,6 @@ async def reset_rate(inter: Interaction, season_name: str, discord_id: str):
 
 
 @bot.tree.command(description="アクティブシーズンを作成（管理者）")
-@commands.has_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def create_season(inter: Interaction, name: str):
     async with SessionLocal() as db:
@@ -1673,7 +1671,7 @@ async def modify(inter: Interaction, session_id: int, match_index: int):
         await inter.response.send_modal(modal)
             
 
-@bot.tree.command(description="【危険】指定シーズンのレートをMatchから再計算（管理者専用）")
+@bot.tree.command(description="指定シーズンのレートをMatchから再計算（管理者）")
 @app_commands.checks.has_permissions(manage_guild=True)
 async def recalc_season_rates(inter: Interaction, season_name: Optional[str] = None):
     """
@@ -1864,7 +1862,6 @@ async def recalc_season_rates(inter: Interaction, season_name: Optional[str] = N
 
 
 @bot.tree.command(description="リーダーボードを表示")
-@commands.has_permissions(manage_guild=True)
 @app_commands.checks.has_permissions(manage_guild=True)
 async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
     async with SessionLocal() as db:
