@@ -1900,5 +1900,3 @@ async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
 
 if __name__ == "__main__":
     bot.run(TOKEN)
-
-#コメント
