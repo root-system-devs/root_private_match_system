@@ -100,7 +100,7 @@ class SeasonScore(Base):
     win_count: Mapped[int] = mapped_column(Integer, default=0)
     # 対戦数
     match_count: Mapped[int] = mapped_column(Integer, default=0)
-
+    # レート
     rate: Mapped[float] = mapped_column(Float, default=2000.0)
 
 
