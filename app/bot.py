@@ -180,9 +180,9 @@ async def _create_next_match_and_message(db, session_id: int) -> str:
 
     players = await get_session_players_with_wins(db, session_id)
     if len(players) < SESSION_MEMBER_NUM:
-        return "プレイヤーが8人揃っていません。"
+        return f"プレイヤーが{SESSION_MEMBER_NUM}人揃っていません。"
 
-    # バランス編成（playersは {user_id, wins} の配列を想定）
+    # バランス編成
     teamA, teamB = split_4v4_min_diff(players)
 
     # 次の match_index を決定
@@ -200,19 +200,39 @@ async def _create_next_match_and_message(db, session_id: int) -> str:
         team_a_ids=",".join(map(str, teamA)),
         team_b_ids=",".join(map(str, teamB)),
     )
-    db.add(m)
-    await db.commit()
-    await db.refresh(m)
+    db.add(m); await db.commit(); await db.refresh(m)
 
-    # 表示用メンションを作成
-    async def mention(uid: int) -> str:
+    # --- ここからメッセージ作成用の内部関数 ---
+    async def get_info(uid: int):
         u = await db.get(User, uid)
-        return f"<@{u.discord_user_id}>" if u else f"(uid:{uid})"
+        # season_id は sess.season_id から取得する
+        sc = await db.scalar(
+            select(SeasonScore).where(
+                and_(SeasonScore.user_id == uid, SeasonScore.season_id == sess.season_id)
+            )
+        )
+        rate = sc.rate if sc else 1500.0
+        mention = f"<@{u.discord_user_id}>" if u else f"(uid:{uid})"
+        return mention, rate
 
+    # 各チームの情報を取得
+    info_a = [await get_info(u) for u in teamA]
+    info_b = [await get_info(u) for u in teamB]
+
+    # 平均レートの計算
+    avg_a = sum([i[1] for i in info_a]) / len(teamA) if teamA else 0
+    avg_b = sum([i[1] for i in info_b]) / len(teamB) if teamB else 0
+
+    # メッセージの組み立て
     msg = (
-        f"**Session {session_id} — Match #{next_idx}**\n"
-        f"Team A: " + " ".join([await mention(u) for u in teamA]) + "\n"
-        f"Team B: " + " ".join([await mention(u) for u in teamB])
+        f"⚔️ **試合開始：Match #{next_idx}** ⚔️\n"
+        f"（セッション ID: `{session_id}`）\n\n"
+        f"🔴 **Team A** (平均: `{avg_a:.1f}`)\n"
+        f"> " + " ".join([i[0] for i in info_a]) + "\n\n"
+        f"🔵 **Team B** (平均: `{avg_b:.1f}`)\n"
+        f"> " + " ".join([i[0] for i in info_b]) + "\n\n"
+        f"--- \n"
+        f"📣 メンバーは各チームのボイスチャンネルへ移動してください！"
     )
     return msg
 
@@ -454,7 +474,7 @@ class RegisterView(ui.View):
                 )
                 if existed_participant:
                     # 既に登録済み → モーダルは出さずに終了
-                    await inter.response.send_message("すでに登録済みです。", ephemeral=True)
+                    await inter.response.send_message("✅ 既にリーグへの登録は完了しています！", ephemeral=True)
                     return
 
         # ここまで来たら未参加 or アクティブシーズンなし → XP入力モーダルを表示
@@ -596,9 +616,12 @@ async def register(inter: Interaction):
         view=RegisterView()
     )
     await inter.response.send_message(
-        f"登録ボタンを表示しました。",
-        ephemeral=True
-    )
+    "🏆 **リーグ参加登録へようこそ！**\n"
+    "適正なチーム分けを行うために、現在の最高XPを登録します。\n"
+    "下のボタンを押して、入力画面に進んでください。",
+    view=RegisterView(),
+    ephemeral=True
+)
 
 
 class RateResetModal(ui.Modal, title="XPを入力（レートリセット）"):
@@ -758,8 +781,8 @@ async def announce(inter: Interaction, week: int):
 
     await inter.channel.send(
         embed=discord.Embed(
-            title=f"Week {week} 参加募集",
-            description="下のボタンで参加/キャンセル。締切まで変更可。"
+            title=f"🎮 第 {week} 週 参加者募集中！",
+            description="対戦に参加される方は、以下のボタンを押してください。\n締切時刻まで、いつでも参加・キャンセルが可能です。"
         ),
         view=EntryView(week)
     )
@@ -771,7 +794,7 @@ class EntryView(ui.View):
         super().__init__(timeout=None)
         self.week = week
 
-    @ui.button(label="参加", style=discord.ButtonStyle.success)
+    @ui.button(label="参加する", style=discord.ButtonStyle.success, emoji="✅")
     async def join(self, inter: Interaction, button: ui.Button):
         async with SessionLocal() as db:
             user = await ensure_user(db, inter.user)
@@ -868,7 +891,7 @@ class EntryView(ui.View):
                 else:
                     await inter.response.send_message("既に参加登録済みです。", ephemeral=True)
 
-    @ui.button(label="キャンセル", style=discord.ButtonStyle.danger)
+    @ui.button(label="キャンセル", style=discord.ButtonStyle.danger, emoji="✖️")
     async def cancel(self, inter: Interaction, button: ui.Button):
         async with SessionLocal() as db:
             user = await ensure_user(db, inter.user)
@@ -1384,16 +1407,23 @@ async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
             # 自動終了（シーズン加算＋ステータス変更）
             finish_msg = await _finish_session(db, session_id)
             room_msg = (
-                f"**記録OK**: Match #{m.match_index} → Team {team} 勝利\n"
-                f"誰かが **10勝** に到達！\n{finish_msg}"
+                f"🏆 **試合結果発表** 🏆\n"
+                f"Match #{m.match_index} ── Team **{team}** 勝利！ ✨\n"
+                f"──────────────────\n"
+                f"🎊 **誰かが 10 勝に到達しました！** 🎊\n"
+                f"本日の試合はこれにて終了です。お疲れ様でした！\n\n"
+                f"{finish_msg}"
             )
             await _post_to_room_channel(inter, room, room_msg)
             await inter.response.send_message("結果を部屋チャンネルへ投稿し、セッションを終了しました。", ephemeral=True)
-        else:
-            # 次試合を自動生成・発表
+        # 次試合を自動生成・発表
+        else:  
             next_msg = await _create_next_match_and_message(db, session_id)
             room_msg = (
-                f"**記録OK**: Match #{m.match_index} → Team {team} 勝利\n\n{next_msg}"
+                f"✅ **Match #{m.match_index} 結果記録**\n"
+                f"勝利チーム： Team **{team}** 🚩\n"
+                f"──────────────────\n\n"
+                f"{next_msg}"
             )
             await _post_to_room_channel(inter, room, room_msg)
             await inter.response.send_message("結果と次試合を部屋チャンネルへ投稿しました。", ephemeral=True)
@@ -1889,10 +1919,11 @@ async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
             await inter.response.send_message("まだスコアがありません。", ephemeral=True)
             return
 
-        lines = [f"**{season.name} Leaderboard (Top 10 / by Rate)**"]
+        lines = [f"👑 **{season.name} 最高レートランキング (TOP 10)** 👑","──────────────────"]
         for i, (sc, u) in enumerate(rows, start=1):
             # ここで match_count や win_count も表示したければ足してOK
-            lines.append(f"{i}. {u.display_name} — {sc.rate:.1f} (W:{sc.win_count} / M:{sc.match_count})")
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            lines.append(f"{medal} **{u.display_name}** — `{sc.rate:.1f} pts` ({sc.win_count}勝 / {sc.match_count}戦)")
 
         await inter.response.send_message("\n".join(lines), ephemeral=False)
 
