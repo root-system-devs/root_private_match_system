@@ -2136,7 +2136,7 @@ async def myrate(inter: Interaction, season_name: Optional[str] = None, last: in
             return
 
         # 初期レート（「シーズン開始時」を厳密に持っていないので xp から推定）
-        initial_rate = compute_initial_rate_from_xp(float(user.xp or 2000))
+        initial_rate = compute_initial_rate_from_xp(float(user.xp -1000 or 1000.0))
 
         # レート推移（Settlementを積み上げ）
         hist = await _get_rate_history(db, season.id, user.id, initial_rate)
