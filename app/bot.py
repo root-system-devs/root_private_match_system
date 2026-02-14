@@ -279,6 +279,7 @@ async def _apply_match_edit(db, match: Match, new_winner: str, new_stage: str) -
                         win_count=0,
                         match_count=0,
                         rate=init_rate,
+                        max_rate=init_rate,
                     )
                     db.add(sc)
                     await db.commit()
@@ -386,6 +387,7 @@ async def _finish_session(db, session_id: int) -> str:
                 win_count=0,
                 match_count=0,
                 rate=init_rate,
+                max_rate=init_rate,
             )
             db.add(sc)
             score_map[uid] = sc
@@ -399,16 +401,34 @@ async def _finish_session(db, session_id: int) -> str:
     k = 20.0
 
     # --- ③ 最新の結果で再精算し、履歴を記録 ---
+    #自己ベスト更新者のリスト
+    pb_updates = []
+    
     for st in stats:
         uid = st.user_id
         sc  = score_map[uid]
+        u   = user_map.get(uid)
 
         win_delta  = int(st.wins)                     # 今セッションでの勝数加算
         rate_delta = float(calc_delta_rate(sc.rate, int(st.wins), avg_rate, max_wins, k))
+        
+        # 更新前の最高レートを記録
+        current_record = max(sc.rate, sc.max_rate or 0.0)
 
         sc.win_count += win_delta
         sc.rate      += rate_delta
-
+        
+        # 最高レートの更新
+        if rate_delta > 0 and sc.rate > current_record:
+            old_record = current_record
+            sc.max_rate = sc.rate
+            if u:
+                pb_updates.append(f"📈 <@{u.discord_user_id}> **自己ベスト更新！** `{old_record:.1f}` → **`{sc.rate:.1f}`**")
+        else:
+        # レートが下がった場合でも、max_rate が NULL だったら現在の値を埋めておく
+            if sc.max_rate is None:
+                sc.max_rate = current_record
+                
         db.add(SessionSettlement(
             season_id=season.id, session_id=session_id, user_id=uid,
             win_delta=win_delta, rate_delta=rate_delta
@@ -418,8 +438,14 @@ async def _finish_session(db, session_id: int) -> str:
     sess.status = "finished"
     await db.commit()
 
-    return (f"Session {session_id} を終了し、当日の勝数・レートを精算しました。"
-            f"（平均レート: {avg_rate:.1f}, K={k:g}）")
+    res_msg = (f"✅ Session {session_id} を終了し、レートを精算しました。\n"
+            f"（平均レート: {avg_rate:.1f}, K={k:g}）\n")
+    
+    # 自己ベスト更新者のメンション
+    if pb_updates:
+        res_msg += "\n✨ **CONGRATULATIONS!** ✨\n" + "\n".join(pb_updates)
+        
+    return res_msg
 
 async def _reopen_session_if_finished(db, session_id: int):
     sess = await db.get(GameSession, session_id)
@@ -539,6 +565,7 @@ class XpModal(ui.Modal, title="XPを入力"):
                         win_count=0,
                         match_count=0,
                         rate=initial_rate,
+                        max_rate = initial_rate #初期レートを最高レートとして設定
                     )
                     db.add(score)
                     created_score = True
@@ -674,6 +701,8 @@ class RateResetModal(ui.Modal, title="XPを入力（レートリセット）"):
             user.xp = xp_val
             initial_rate = compute_initial_rate_from_xp(xp_val)
             score.rate = initial_rate
+            if initial_rate > (score.max_rate or 0):
+                score.max_rate = initial_rate
             await db.commit()
 
         await inter.response.send_message(
@@ -862,6 +891,7 @@ class EntryView(ui.View):
                         win_count=0,
                         match_count=0,
                         rate=(user.xp or 1000.0),
+                        max_rate=(user.xp or 1000.0),
                     )
                     db.add(score)
                 score.entry_count += 1
@@ -883,6 +913,7 @@ class EntryView(ui.View):
                             win_count=0,
                             match_count=0,
                             rate=(user.xp or 1000.0),
+                            max_rate=(user.xp or 1000.0),
                         )
                         db.add(score)
                     score.entry_count += 1
@@ -1378,6 +1409,7 @@ async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
                             win_count=0,
                             match_count=0,
                             rate=init_rate,
+                            max_rate=init_rate,
                         )
                         db.add(sc)
                         await db.commit()
@@ -1762,6 +1794,7 @@ async def recalc_season_rates(inter: Interaction, season_name: Optional[str] = N
                     win_count=0,
                     match_count=0,
                     rate=init_rate,
+                    max_rate=init_rate,
                 )
                 db.add(sc)
         await db.commit()

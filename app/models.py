@@ -102,6 +102,8 @@ class SeasonScore(Base):
     match_count: Mapped[int] = mapped_column(Integer, default=0)
     # レート
     rate: Mapped[float] = mapped_column(Float, default=2000.0)
+    # 最高レート
+    max_rate: Mapped[float] = mapped_column(Float, default=2000.0)
 
 
 class Match(Base):
