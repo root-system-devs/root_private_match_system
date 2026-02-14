@@ -480,129 +480,6 @@ async def _reopen_session_if_finished(db, session_id: int):
     sess.status = "live"
     await db.commit()
 
-# ---- 文字スパークライン（超簡易グラフ）----
-_SPARK = "▁▂▃▄▅▆▇█"
-
-def _sparkline(values: list[float]) -> str: #簡易グラフの表示
-    if not values: #値が存在しない場合何もなし
-        return ""
-    vmin = min(values)
-    vmax = max(values)
-    if math.isclose(vmin, vmax): #最小値と最大値が同じ場合最小の高さを繰り返す
-        return _SPARK[0] * len(values)
-    out = []
-    for v in values:
-        t = (v - vmin) / (vmax - vmin)  # 最小値との相対的な差
-        idx = min(len(_SPARK) - 1, max(0, int(round(t * (len(_SPARK) - 1))))) #グラフの棒の選択(四捨五入で7パターン)
-        out.append(_SPARK[idx]) #選択した棒の追加
-    return "".join(out)
-
-async def _get_user_rank_by_rate(db, season_id: int, user_id: int) -> int: #ユーザーの順位を返す関数
-    my_rate = await db.scalar(
-        select(SeasonScore.rate).where(and_(SeasonScore.season_id == season_id, SeasonScore.user_id == user_id))
-    )#該当するプレイヤーのレート検索
-    if my_rate is None:
-        return 0
-
-    higher = await db.scalar(
-        select(func.count()).select_from(SeasonScore).where(
-            and_(SeasonScore.season_id == season_id, SeasonScore.rate > float(my_rate))
-        )#同シーズンで該当プレイヤーよりレートが高い者の数を調べる
-    )
-    return int(higher or 0) + 1
-
-async def _get_rate_history(db, season_id: int, user_id: int, initial_rate: float) -> list[tuple[str, float]]:
-    
-    rows = (await db.execute(
-        select(GameSession.scheduled_at, SessionSettlement.rate_delta)
-        .select_from(SessionSettlement)
-        .join(GameSession, GameSession.id == SessionSettlement.session_id)
-        .where(
-            and_(
-                SessionSettlement.season_id == season_id,
-                SessionSettlement.user_id == user_id,
-            )
-        )
-        .order_by(GameSession.scheduled_at, GameSession.id)
-    )).all() #SessionSettlement.rate_delta を scheduled_at 順に積み上げて(日付ラベル, 累積レート) の配列を返す。
-
-    rate = float(initial_rate)
-    hist: list[tuple[str, float]] = []
-    for scheduled_at, delta in rows:
-        rate += float(delta or 0.0)
-        # 表示ラベル（例：02/03）
-        if scheduled_at.tzinfo is None:
-            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
-
-        label = scheduled_at.astimezone(timezone.utc).strftime("%m/%d")
-
-        hist.append((label, rate))
-    return hist
-
-def _build_profile_embed(
-    season_name: str,
-    user_display: str,
-    rank: int,
-    sc: SeasonScore,
-    initial_rate: float,
-    history: list[tuple[str, float]],
-    last: float
-) -> discord.Embed:
-    embed = discord.Embed(
-        title=f"{season_name} — {user_display} のレート",
-        color=0x2B2D31,
-    )
-
-    cur_rate = float(sc.rate or 0.0)
-    embed.add_field(
-        name="現在",
-        value=(
-            f"**Rate:** {cur_rate:.1f}\n"
-            f"**Rank:** #{rank if rank > 0 else '-'}\n"
-            f"**W/M:** {int(sc.win_count or 0)}/{int(sc.match_count or 0)}\n"
-            f"**参加回数:** {int(sc.entry_count or 0)}"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="初期",
-        value=f"初期レート: **{float(initial_rate):.1f}**",
-        inline=True
-    )
-
-    if not history:
-        embed.add_field(
-            name="推移",
-            value="まだ試合の精算履歴がありません（SessionSettlement が未作成）。",
-            inline=False
-        )
-        return embed
-
-    # 直近 last 件に絞る
-    tail = history[-last:] if last > 0 else history
-    labels = [t[0] for t in tail]
-    values = [t[1] for t in tail]
-
-    spark = _sparkline(values)
-    # 見やすく「日付: レート」を数件だけ表示（全部は長くなる）
-    lines = [f"{lab}: {val:.1f}" for lab, val in tail[-min(len(tail), 10):]]
-
-    embed.add_field(
-        name=f"推移（直近{len(tail)}セッション）",
-        value="```" + spark + "```",
-        inline=False
-    )
-    embed.add_field(
-        name="直近ログ（最大10件）",
-        value="```" + "\n".join(lines) + "```",
-        inline=False
-    )
-
-    # 参考：min/max
-    embed.set_footer(text=f"min {min(values):.1f} / max {max(values):.1f}")
-    return embed
-
 # ---- 永続ビュー ----
 class RegisterView(ui.View):
     def __init__(self):
@@ -2086,10 +1963,133 @@ async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
 
         await inter.response.send_message("\n".join(lines), ephemeral=False)
 
+# ---- 文字スパークライン（超簡易グラフ）----
+_SPARK = "▁▂▃▄▅▆▇█"
+
+def _sparkline(values: list[float]) -> str: #簡易グラフの表示
+    if not values: #値が存在しない場合何もなし
+        return ""
+    vmin = min(values)
+    vmax = max(values)
+    if math.isclose(vmin, vmax): #最小値と最大値が同じ場合最小の高さを繰り返す
+        return _SPARK[0] * len(values)
+    out = []
+    for v in values:
+        t = (v - vmin) / (vmax - vmin)  # 最小値との相対的な差
+        idx = min(len(_SPARK) - 1, max(0, int(round(t * (len(_SPARK) - 1))))) #グラフの棒の選択(四捨五入で7パターン)
+        out.append(_SPARK[idx]) #選択した棒の追加
+    return "".join(out)
+
+async def _get_user_rank_by_rate(db, season_id: int, user_id: int) -> int: #ユーザーの順位を返す関数
+    my_rate = await db.scalar(
+        select(SeasonScore.rate).where(and_(SeasonScore.season_id == season_id, SeasonScore.user_id == user_id))
+    )#該当するプレイヤーのレート検索
+    if my_rate is None:
+        return 0
+
+    higher = await db.scalar(
+        select(func.count()).select_from(SeasonScore).where(
+            and_(SeasonScore.season_id == season_id, SeasonScore.rate > float(my_rate))
+        )#同シーズンで該当プレイヤーよりレートが高い者の数を調べる
+    )
+    return int(higher or 0) + 1
+
+async def _get_rate_history(db, season_id: int, user_id: int, initial_rate: float) -> list[tuple[str, float]]:
+    
+    rows = (await db.execute(
+        select(GameSession.scheduled_at, SessionSettlement.rate_delta)
+        .select_from(SessionSettlement)
+        .join(GameSession, GameSession.id == SessionSettlement.session_id)
+        .where(
+            and_(
+                SessionSettlement.season_id == season_id,
+                SessionSettlement.user_id == user_id,
+            )
+        )
+        .order_by(GameSession.scheduled_at, GameSession.id)
+    )).all() #SessionSettlement.rate_delta を scheduled_at 順に積み上げて(日付ラベル, 累積レート) の配列を返す。
+
+    rate = float(initial_rate)
+    hist: list[tuple[str, float]] = []
+    for scheduled_at, delta in rows:
+        rate += float(delta or 0.0)
+        # 表示ラベル（例：02/03）
+        if scheduled_at.tzinfo is None:
+            scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+
+        label = scheduled_at.astimezone(timezone.utc).strftime("%m/%d")
+
+        hist.append((label, rate))
+    return hist
+
+def _build_profile_embed(
+    season_name: str,
+    user_display: str,
+    rank: int,
+    sc: SeasonScore,
+    initial_rate: float,
+    history: list[tuple[str, float]],
+    last: float
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"{season_name} — {user_display} のレート",
+        color=0x2B2D31,
+    )
+
+    cur_rate = float(sc.rate or 0.0)
+    embed.add_field(
+        name="現在",
+        value=(
+            f"**Rate:** {cur_rate:.1f}\n"
+            f"**Rank:** #{rank if rank > 0 else '-'}\n"
+            f"**W/M:** {int(sc.win_count or 0)}/{int(sc.match_count or 0)}\n"
+            f"**参加回数:** {int(sc.entry_count or 0)}"
+        ),
+        inline=True
+    )
+
+    embed.add_field(
+        name="初期",
+        value=f"初期レート: **{float(initial_rate):.1f}**",
+        inline=True
+    )
+
+    if not history:
+        embed.add_field(
+            name="推移",
+            value="まだ試合の精算履歴がありません（SessionSettlement が未作成）。",
+            inline=False
+        )
+        return embed
+
+    # 直近 last 件に絞る
+    tail = history[-last:] if last > 0 else history
+    labels = [t[0] for t in tail]
+    values = [t[1] for t in tail]
+
+    spark = _sparkline(values)
+    # 見やすく「日付: レート」を数件だけ表示（全部は長くなる）
+    lines = [f"{lab}: {val:.1f}" for lab, val in tail[-min(len(tail), 10):]]
+
+    embed.add_field(
+        name=f"推移（直近{len(tail)}セッション）",
+        value="```" + spark + "```",
+        inline=False
+    )
+    embed.add_field(
+        name="直近ログ（最大10件）",
+        value="```" + "\n".join(lines) + "```",
+        inline=False
+    )
+
+    # 参考：min/max
+    embed.set_footer(text=f"min {min(values):.1f} / max {max(values):.1f}")
+    return embed
 
 
-
-
+# =========================
+# /myrate コマンド
+# =========================
 @bot.tree.command(description="自分の現在レートと推移を表示")
 async def myrate(inter: Interaction, season_name: Optional[str] = None, last: int = 20):
     """
