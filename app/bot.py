@@ -1925,7 +1925,6 @@ async def recalc_season_rates(inter: Interaction, season_name: Optional[str] = N
 
 
 @bot.tree.command(description="リーダーボードを表示")
-@app_commands.default_permissions(manage_guild=True)
 async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
     async with SessionLocal() as db:
         # シーズン取得
