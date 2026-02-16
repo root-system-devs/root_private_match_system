@@ -477,6 +477,145 @@ async def _reopen_session_if_finished(db, session_id: int):
     sess.status = "live"
     await db.commit()
 
+async def _get_user_rank_by_rate(db, season_id: int, user_id: int) -> int: #ユーザーの順位を返す関数
+    my_rate = await db.scalar(
+        select(SeasonScore.rate).where(and_(SeasonScore.season_id == season_id, SeasonScore.user_id == user_id))
+    )#該当するプレイヤーのレート検索
+    if my_rate is None:
+        return 0
+
+    higher = await db.scalar(
+        select(func.count()).select_from(SeasonScore).where(
+            and_(SeasonScore.season_id == season_id, SeasonScore.rate > float(my_rate))
+        )#同シーズンで該当プレイヤーよりレートが高い者の数を調べる
+    )
+    return int(higher or 0) + 1
+
+async def _get_rate_history(db, season_id: int, user_id: int, initial_rate: float) -> list[tuple[str, float]]:
+    
+    rows = (await db.execute(
+        select(GameSession.week_number, SessionSettlement.rate_delta)
+        .select_from(SessionSettlement)
+        .join(GameSession, GameSession.id == SessionSettlement.session_id)
+        .where(
+            and_(
+                SessionSettlement.season_id == season_id,
+                SessionSettlement.user_id == user_id,
+            )
+        )
+        .order_by(GameSession.week_number, GameSession.id)
+    )).all() #SessionSettlement.rate_delta を week_number 順に積み上げて(日付ラベル, 累積レート) の配列を返す。
+
+    rate = float(initial_rate)
+    hist: list[tuple[str, float]] = []
+    for week_number, delta in rows:
+        rate += float(delta or 0.0)
+    
+
+        label = str(week_number)
+
+        hist.append((label, rate))
+    return hist
+
+
+import io
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+def render_rate_chart_png(labels: list[str], values: list[float]) -> io.BytesIO:#グラフの作成をしてpngファイルとして返す
+
+    #グラフと描画領域の生成
+    fig, ax = plt.subplots(figsize=(7, 3))
+
+    #axの内容
+    ax.plot(values, marker="o", linewidth=1.5)
+    ax.set_title("Rate History")
+    ax.set_ylabel("Rate")
+    ax.grid(True, linewidth=0.5, alpha=0.5)
+
+    # ラベル（日付）が多いと潰れるので間隔をあけて設定
+    n = len(labels)
+    step = max(1, n // 4)
+    ax.set_xlabel("Week number")
+    ax.set_xticks(list(range(0, n, step)))
+    ax.set_xticklabels([labels[i] for i in range(0, n, step)], rotation=0)
+
+    #pngファイルの作成（io を用いてメモリ上に保存）
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _build_profile_embed(
+    season_name: str,
+    user_display: str,
+    rank: int,
+    sc: SeasonScore,
+    initial_rate: float,
+    history: list[tuple[str, float]],
+    last: float
+) -> discord.Embed:#myrateで表示するメッセージの内容
+    embed = discord.Embed(
+        title=f"{season_name} — {user_display} のレート",
+        color=0x2B2D31,
+    )
+
+    cur_rate = float(sc.rate or 0.0)
+    embed.add_field(
+        name="現在",
+        value=(
+            f"**Rate:** {cur_rate:.1f}\n"
+            f"**Rank:** #{rank if rank > 0 else '-'}\n"
+            f"**W/M:** {int(sc.win_count or 0)}/{int(sc.match_count or 0)}\n"
+            f"**参加回数:** {int(sc.entry_count or 0)}"
+        ),
+        inline=True
+    )
+    
+    embed.add_field(
+        name="初期",
+        value=f"初期レート: **{float(initial_rate):.1f}**",
+        inline=True
+    )
+    
+
+    if not history:
+        embed.add_field(
+            name="推移",
+            value="まだ試合の精算履歴がありません（SessionSettlement が未作成）。",
+            inline=False
+        )
+    
+
+    # 直近 last 件に絞る
+    tail = history[-last:] if last > 0 else history
+    labels = [t[0] for t in tail]
+    values = [t[1] for t in tail]
+    
+    #spark = _sparkline(values)#ここがバグってる
+    
+    # 見やすく「日付: レート」を数件だけ表示（全部は長くなる）
+    lines = [f"{lab}: {val:.1f}" for lab, val in tail[-min(len(tail), 10):]]
+    """
+    embed.add_field(
+        name=f"推移（直近{len(tail)}セッション）",
+        value="```" + spark + "```",
+        inline=False
+    )
+    """
+    embed.add_field(
+        name="直近ログ（最大10件）",
+        value="```" + "\n".join(lines) + "```",
+        inline=False
+    )
+
+    # 参考：min/max
+    embed.set_footer(text=f"min {min(values):.1f} / max {max(values):.1f}")
+    return embed
+
 # ---- 永続ビュー ----
 class RegisterView(ui.View):
     def __init__(self):
@@ -1960,6 +2099,83 @@ async def leaderboard(inter: Interaction, season_name: Optional[str] = None):
         await inter.response.send_message("\n".join(lines), ephemeral=False)
 
 
+@bot.tree.command(description="自分の現在レートと推移を表示")
+async def myrate(inter: Interaction, season_name: Optional[str] = None, last: int = 20):
+
+    """
+    last: 直近何セッション分の推移を見るか（デフォルト20）
+    """
+    if last < 1:
+        last = 20
+    if last > 20:
+        last = 20  # 適当な上限
+
+    async with SessionLocal() as db:
+        # 対象シーズン
+        if season_name:
+            season = await db.scalar(select(Season).where(Season.name == season_name))
+        else:
+            season = await get_active_season(db)
+
+        if not season:
+            await inter.response.send_message("シーズンが見つかりません。", ephemeral=True)
+            return
+
+        # 自分のUser行
+        user = await ensure_user(db, inter.user)
+
+        # 参加者チェック（任意）
+        is_participant = await db.scalar(
+            select(SeasonParticipant).where(
+                and_(SeasonParticipant.season_id == season.id, SeasonParticipant.user_id == user.id)
+            )
+        )
+        if not is_participant:
+            await inter.response.send_message(
+                f"{inter.user.mention} さんはシーズン「{season.name}」の参加者ではありません。",
+                ephemeral=True
+            )
+            return
+
+        # SeasonScore（現在値）
+        sc = await db.scalar(
+            select(SeasonScore).where(and_(SeasonScore.season_id == season.id, SeasonScore.user_id == user.id))
+        )
+        if not sc:
+            await inter.response.send_message("まだスコアがありません。", ephemeral=True)
+            return
+
+        # 初期レート（「シーズン開始時」を厳密に持っていないので xp から推定）
+        initial_rate = compute_initial_rate_from_xp(float(user.xp  or 2000.0))
+
+        # レート推移（Settlementを積み上げ）
+        hist = await _get_rate_history(db, season.id, user.id, initial_rate)
+
+        # 順位（レート順）
+        rank = await _get_user_rank_by_rate(db, season.id, user.id)
+    
+    embed = _build_profile_embed(
+        season_name=season.name,
+        user_display=user.display_name,
+        rank=rank,
+        sc=sc,
+        initial_rate=initial_rate,
+        history=hist,
+        last=last
+    ) #表示内容 
+        # hist から labels/values を作る（embed内で既に作っててもOK）
+    tail = hist[-last:] if last > 0 else hist
+    labels = [t[0] for t in tail]
+    values = [t[1] for t in tail]
+
+    # 画像生成して添付
+    if len(values) >= 2:
+        buf = render_rate_chart_png(labels, values)
+        file = discord.File(fp=buf, filename="rate.png")
+        embed.set_image(url="attachment://rate.png")
+        await inter.response.send_message(embed=embed, file=file, ephemeral=True)
+    else:
+        await inter.response.send_message(embed=embed, ephemeral=True)
 
 if __name__ == "__main__":
     bot.run(TOKEN)
