@@ -33,6 +33,27 @@ async def on_ready():
     await bot.tree.sync()
     bot.add_view(RegisterView())
     print(f"Logged in as {bot.user}")
+    
+# ステージ名のリスト
+STAGE_LIST = [
+    "ユノハナ大渓谷", "ゴンズイ地区", "ヤガラ市場", "マテガイ放水路", 
+    "ナメロウ金属", "クサヤ温泉", "ヒラメが丘団地", "ナンプラー遺跡", 
+    "タラポートショッピングパーク", "コンブトラック", "タカアシ経済特区", 
+    "オヒョウ海運","バイガイ亭","カジキ空港","リュウグウターミナル",
+    "マサバ海峡大橋","マヒマヒリゾート＆スパ","キンメダイ美術館","スメーシーワールド",
+    "ザトウマーケット","チョウザメ造船","海女美術大学","マンタマリア号",
+    "ネギトロ炭鉱","デカライン高架下"
+]
+
+# オートコンプリート用の関数
+async def stage_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    return [
+        app_commands.Choice(name=stage, value=stage)
+        for stage in STAGE_LIST if current in stage
+    ][:25]  # Discordの仕様で最大25件まで
 
 def compute_initial_rate_from_xp(xp: float) -> float:
     """
@@ -1463,7 +1484,8 @@ async def cancel_reopen_session(inter: Interaction, session_id: int):
 
 
 @bot.tree.command(description="直近未確定の試合に勝敗を記録")
-async def win(inter: Interaction, session_id: int, team: str, stage: str = ""):
+@app_commands.autocomplete(stage=stage_autocomplete)
+async def win(inter: Interaction, session_id: int, team: str, stage: str):
     team = team.upper()
     if team not in ("A", "B"):
         await inter.response.send_message("team は A または B", ephemeral=True)
