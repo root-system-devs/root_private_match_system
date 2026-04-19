@@ -24,7 +24,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 ROOM_LABELS = list("123456789")
 # 1セッションあたりの人数（テストでは2や4に変更可能）
-SESSION_MEMBER_NUM = 4
+SESSION_MEMBER_NUM = 8
 
 
 @bot.event
